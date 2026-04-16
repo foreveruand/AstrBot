@@ -345,7 +345,10 @@ class FunctionToolExecutor(BaseFunctionToolExecutor[AstrAgentContext]):
         specified_provider_id = getattr(tool, "provider_id", None)
         prov_id = specified_provider_id
         if not prov_id:
-            selected_provider_id = event.get_extra("selected_provider")
+            get_extra = getattr(event, "get_extra", None)
+            selected_provider_id = (
+                get_extra("selected_provider") if callable(get_extra) else None
+            )
             if isinstance(selected_provider_id, str):
                 selected_provider_id = selected_provider_id.strip() or None
             else:

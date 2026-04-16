@@ -58,7 +58,7 @@ index d668dfeec98086aa59398cd458de90b52df89569..cf5627548e8faad6bbab108ae46709c0
                      toolset.add_tool(registered_tool)
                      continue
                  runtime_tool = runtime_computer_tools.get(tool_name_or_obj)
-@@ -311,9 +342,23 @@ class FunctionToolExecutor(BaseFunctionToolExecutor[AstrAgentContext]):
+@@ -311,9 +342,26 @@ class FunctionToolExecutor(BaseFunctionToolExecutor[AstrAgentContext]):
  
          # Use per-subagent provider override if configured; otherwise fall back
          # to the current/default provider resolution.
@@ -68,7 +68,10 @@ index d668dfeec98086aa59398cd458de90b52df89569..cf5627548e8faad6bbab108ae46709c0
 +        specified_provider_id = getattr(tool, "provider_id", None)
 +        prov_id = specified_provider_id
 +        if not prov_id:
-+            selected_provider_id = event.get_extra("selected_provider")
++            get_extra = getattr(event, "get_extra", None)
++            selected_provider_id = (
++                get_extra("selected_provider") if callable(get_extra) else None
++            )
 +            if isinstance(selected_provider_id, str):
 +                selected_provider_id = selected_provider_id.strip() or None
 +            else:

@@ -20,6 +20,13 @@ git -C "$repo_root" rev-parse --verify "$source_ref" >/dev/null
 git -C "$repo_root" rev-parse --verify "$base_ref" >/dev/null
 git -C "$repo_root" worktree add --detach "$worktree" "$base_ref" >/dev/null
 
+apply_handoff_get_extra_compat() {
+  local file="$worktree/astrbot/core/astr_agent_tool_exec.py"
+  if grep -q 'selected_provider_id = event.get_extra("selected_provider")' "$file"; then
+    perl -0pi -e 's/selected_provider_id = event\.get_extra\("selected_provider"\)/get_extra = getattr(event, "get_extra", None)\n            selected_provider_id = (\n                get_extra("selected_provider") if callable(get_extra) else None\n            )/' "$file"
+  fi
+}
+
 make_patch() {
   local patch_name="$1"
   shift
@@ -30,6 +37,9 @@ make_patch() {
     fi
     git -C "$worktree" cherry-pick --no-commit "$commit"
   done
+  if [[ "$patch_name" == "0004-subagent-provider-fallback.patch" ]]; then
+    apply_handoff_get_extra_compat
+  fi
   git -C "$worktree" diff --binary --full-index HEAD > "$patch_dir/$patch_name"
   git -C "$worktree" add -A
   git -C "$worktree" commit -m "refresh: $patch_name" >/dev/null
