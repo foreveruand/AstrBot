@@ -183,9 +183,9 @@ DEFAULT_CONFIG = {
     },
     # SubAgent orchestrator mode:
     # - main_enable = False: disabled; main LLM mounts tools normally (persona selection).
-    # - main_enable = True: enabled; main LLM keeps its own tools and includes handoff
-    #   tools (transfer_to_*). remove_main_duplicate_tools can remove tools that are
-    #   duplicated on subagents from the main LLM toolset.
+    # - main_enable = True: enabled; main LLM can use handoff tools (transfer_to_*)
+    #   selected by the active persona. remove_main_duplicate_tools can remove tools
+    #   that are duplicated on the selected subagents from the main LLM toolset.
     "subagent_orchestrator": {
         "main_enable": False,
         "remove_main_duplicate_tools": False,

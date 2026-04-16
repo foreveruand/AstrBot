@@ -5,6 +5,9 @@ from astrbot.core.message.components import At, AtAll, Reply
 from astrbot.core.message.message_event_result import MessageChain, MessageEventResult
 from astrbot.core.platform.astr_message_event import AstrMessageEvent
 from astrbot.core.platform.message_type import MessageType
+from astrbot.core.platform.sources.telegram.inline_registry import (
+    telegram_inline_result_registry,
+)
 from astrbot.core.star.filter.command import CommandFilter
 from astrbot.core.star.filter.command_group import CommandGroupFilter
 from astrbot.core.star.filter.permission import PermissionTypeFilter
@@ -156,10 +159,41 @@ class WakingCheckStage(Stage):
         )
         chosen_inline_command_mode = False
         if is_chosen_inline_result:
-            self._set_enabled_plugins(event)
-            event.is_wake = True
-            event.is_at_or_wake_command = True
-            chosen_inline_command_mode = self._normalize_command_prefix(event)
+            target = telegram_inline_result_registry.resolve(str(event.result_id))
+            if target is not None:
+                self._set_enabled_plugins(event)
+                event.is_wake = True
+                event.is_at_or_wake_command = True
+                if target.query:
+                    event.query = target.query
+                    event.message_str = target.query
+
+                if target.use_command_flow:
+                    chosen_inline_command_mode = self._normalize_command_prefix(event)
+                elif target.kind == "plugin":
+                    activated_handlers = target.handlers or []
+                    activated_handlers = (
+                        await SessionPluginManager.filter_handlers_by_session(
+                            event,
+                            activated_handlers,
+                        )
+                    )
+                    event.call_llm = True
+                    event.set_extra("activated_handlers", activated_handlers)
+                    event.set_extra("handlers_parsed_params", {})
+                    return
+
+                else:
+                    event.call_llm = False
+                    event.set_extra("activated_handlers", [])
+                    event.set_extra("handlers_parsed_params", {})
+                    return
+
+            else:
+                self._set_enabled_plugins(event)
+                event.is_wake = True
+                event.is_at_or_wake_command = True
+                chosen_inline_command_mode = self._normalize_command_prefix(event)
 
         # 检查 wake
         wake_prefixes = self.ctx.astrbot_config["wake_prefix"]

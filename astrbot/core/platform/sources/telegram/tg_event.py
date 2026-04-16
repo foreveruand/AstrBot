@@ -1085,7 +1085,7 @@ class TelegramInlineQueryEvent(AstrMessageEvent):
         if not text:
             return []
         chunks = TelegramPlatformEvent._split_message(text)
-        thumb_url = "https://user-images.githubusercontent.com/11541888/223106202-7576ff11-2c8e-408d-94ea-b02a7a32149a.png"
+        thumb_url = "https://raw.githubusercontent.com/AstrBotDevs/AstrBot/7c39abc6b5ce0e61c10ed2d7c41a4079d771d6cf/dashboard/src/assets/images/astrbot_logo_mini.webp"
         if self._INLINE_ARTICLE_PARAMS is None:
             try:
                 self._INLINE_ARTICLE_PARAMS = set(
@@ -1129,6 +1129,54 @@ class TelegramInlineQueryEvent(AstrMessageEvent):
             )
         return results
 
+    async def _build_inline_option_results(
+        self, options: list[dict[str, Any]]
+    ) -> list[InlineQueryResultArticle]:
+        if self._INLINE_ARTICLE_PARAMS is None:
+            try:
+                self._INLINE_ARTICLE_PARAMS = set(
+                    inspect.signature(InlineQueryResultArticle).parameters.keys(),
+                )
+            except Exception:
+                self._INLINE_ARTICLE_PARAMS = set()
+
+        thumb_url = "https://raw.githubusercontent.com/AstrBotDevs/AstrBot/7c39abc6b5ce0e61c10ed2d7c41a4079d771d6cf/dashboard/src/assets/images/astrbot_logo_mini.webp"
+        query_preview = self.query or "inline query"
+        results: list[InlineQueryResultArticle] = []
+        for option in options[: self.MAX_INLINE_RESULTS]:
+            title = str(option.get("title") or "AstrBot")
+            description = str(option.get("description") or "")
+            if len(description) > self.MAX_INLINE_DESCRIPTION_LEN:
+                description = description[: self.MAX_INLINE_DESCRIPTION_LEN - 3] + "..."
+            placeholder = f"{title} is preparing a response for: {query_preview}"
+            kwargs = {
+                "id": str(option["id"]),
+                "title": title,
+                "description": description,
+                "input_message_content": InputTextMessageContent(
+                    message_text=placeholder[
+                        : TelegramPlatformEvent.MAX_MESSAGE_LENGTH
+                    ],
+                ),
+                "reply_markup": InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                "Waiting for response",
+                                callback_data="astrbot_inline_waiting",
+                            )
+                        ]
+                    ],
+                ),
+            }
+            if thumb_url:
+                if "thumb_url" in self._INLINE_ARTICLE_PARAMS:
+                    kwargs["thumb_url"] = thumb_url
+                elif "thumbnail_url" in self._INLINE_ARTICLE_PARAMS:
+                    kwargs["thumbnail_url"] = thumb_url
+            results.append(InlineQueryResultArticle(**kwargs))
+        return results
+
     async def _answer_inline_query(self, text: str) -> None:
         results = await self._build_inline_results(text)
         if not results:
@@ -1146,6 +1194,21 @@ class TelegramInlineQueryEvent(AstrMessageEvent):
             )
         except Exception as e:
             logger.warning(f"answer_inline_query 失败: {e!s}")
+
+    async def answer_inline_options(self, options: list[dict[str, Any]]) -> None:
+        results = await self._build_inline_option_results(options)
+        if not results:
+            logger.warning("TelegramInlineQueryEvent 无可用选项，跳过响应。")
+            return
+        try:
+            await self.client.answer_inline_query(
+                inline_query_id=self.inline_query_id,
+                results=results,
+                cache_time=0,
+                is_personal=True,
+            )
+        except Exception as e:
+            logger.warning(f"answer_inline_query 选项响应失败: {e!s}")
 
     async def send_with_client(
         self, client: ExtBot, message_chain: MessageChain, user_name: str
@@ -1577,6 +1640,66 @@ class TelegramChosenInlineResultEvent(AstrMessageEvent):
             kwargs["parse_mode"] = parse_mode
         await self.client.edit_message_text(**kwargs)
 
+    async def _resolve_inline_photo_media(self, image: Image) -> str | None:
+        media = image.url or image.file
+        if not media:
+            return None
+        if media.startswith(("http://", "https://")):
+            return media
+        if media.startswith("file://") or media.startswith("base64://"):
+            try:
+                return await image.register_to_file_service()
+            except Exception as e:
+                logger.warning(
+                    "Cannot expose local inline image via file service; falling back to text edit: "
+                    f"{e!s}"
+                )
+                return None
+        if os.path.exists(media):
+            try:
+                return await image.register_to_file_service()
+            except Exception as e:
+                logger.warning(
+                    "Cannot expose local inline image via file service; falling back to text edit: "
+                    f"{e!s}"
+                )
+                return None
+        # Telegram accepts existing file_id values when editing inline media.
+        return media
+
+    async def _edit_inline_photo_message(
+        self,
+        image: Image,
+        caption: str | None,
+        reply_markup=None,
+    ) -> bool:
+        if not self.inline_message_id:
+            logger.debug(
+                "TelegramChosenInlineResultEvent 缺少 inline_message_id，跳过媒体编辑。"
+            )
+            return False
+
+        media = await self._resolve_inline_photo_media(image)
+        if not media:
+            return False
+
+        try:
+            await self.client.edit_message_media(
+                inline_message_id=self.inline_message_id,
+                media=InputMediaPhoto(
+                    media=media,
+                    caption=caption[: TelegramPlatformEvent.MAX_CAPTION_LENGTH]
+                    if caption
+                    else None,
+                    has_spoiler=image.use_spoiler,
+                ),
+                reply_markup=reply_markup,
+            )
+            return True
+        except Exception as e:
+            logger.warning(f"编辑内联图片消息失败，回退到文本编辑: {e!s}")
+            return False
+
     async def send_with_client(
         self, client: ExtBot, message_chain: MessageChain, user_name: str
     ) -> None:
@@ -1601,6 +1724,18 @@ class TelegramChosenInlineResultEvent(AstrMessageEvent):
                 logger.warning(
                     f"Failed to convert reply_markup to InlineKeyboardMarkup: {e}"
                 )
+
+        first_image = next(
+            (comp for comp in message_chain.chain if isinstance(comp, Image)), None
+        )
+        if first_image is not None:
+            media_caption = message_chain.get_plain_text().strip()
+            if await self._edit_inline_photo_message(
+                first_image,
+                media_caption or None,
+                reply_markup=reply_markup_keyboard,
+            ):
+                return
 
         full_text, entities = self._build_inline_entities(text)
         try:
