@@ -1,0 +1,1501 @@
+diff --git a/astrbot/api/event/filter/__init__.py b/astrbot/api/event/filter/__init__.py
+index 650bce042537d206af991621f612e414c38dcf1c..c67a96c9c3629afc213b5c3b1fd6c0f46e3fa233 100644
+--- a/astrbot/api/event/filter/__init__.py
++++ b/astrbot/api/event/filter/__init__.py
+@@ -9,10 +9,15 @@ from astrbot.core.star.filter.platform_adapter_type import (
+     PlatformAdapterTypeFilter,
+ )
+ from astrbot.core.star.register import register_after_message_sent as after_message_sent
++from astrbot.core.star.register import (
++    register_chosen_inline_result as chosen_inline_result,
++)
++from astrbot.core.star.register import register_callback_query as callback_query
+ from astrbot.core.star.register import register_command as command
+ from astrbot.core.star.register import register_command_group as command_group
+ from astrbot.core.star.register import register_custom_filter as custom_filter
+ from astrbot.core.star.register import register_event_message_type as event_message_type
++from astrbot.core.star.register import register_inline_query as inline_query
+ from astrbot.core.star.register import register_llm_tool as llm_tool
+ from astrbot.core.star.register import register_on_agent_begin as on_agent_begin
+ from astrbot.core.star.register import register_on_agent_done as on_agent_done
+@@ -48,10 +53,13 @@ __all__ = [
+     "PlatformAdapterType",
+     "PlatformAdapterTypeFilter",
+     "after_message_sent",
++    "callback_query",
++    "chosen_inline_result",
+     "command",
+     "command_group",
+     "custom_filter",
+     "event_message_type",
++    "inline_query",
+     "llm_tool",
+     "on_agent_begin",
+     "on_agent_done",
+diff --git a/astrbot/builtin_stars/telegram_keyboard_demo/__init__.py b/astrbot/builtin_stars/telegram_keyboard_demo/__init__.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
+diff --git a/astrbot/builtin_stars/telegram_keyboard_demo/main.py b/astrbot/builtin_stars/telegram_keyboard_demo/main.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f0e01b29636e8acd085addde726836d067316e01
+--- /dev/null
++++ b/astrbot/builtin_stars/telegram_keyboard_demo/main.py
+@@ -0,0 +1,47 @@
++from astrbot.api import star
++from astrbot.api.event import AstrMessageEvent, MessageEventResult, filter
++from astrbot.core.platform.sources.telegram.tg_event import TelegramCallbackQueryEvent
++
++
++class Main(star.Star):
++    """Telegram keyboard demo plugin - demonstrates inline keyboard and callback query handling."""
++
++    def __init__(self, context: star.Context) -> None:
++        self.context = context
++        self.click_counts: dict[str, int] = {}  # Store click counts by user_id
++
++    @filter.command("keyboard")
++    async def keyboard(self, event: AstrMessageEvent) -> None:
++        """Display a message with an inline keyboard button."""
++        # Get the original message
++        original_msg = event.message_str
++
++        # Create a message with inline keyboard
++        result = MessageEventResult()
++        result.message(f"You said: {original_msg}")
++        result.inline_keyboard(
++            [[{"text": "Click me", "callback_data": f"click_{event.get_sender_id()}"}]]
++        )
++        event.set_result(result)
++
++    @filter.callback_query()
++    async def handle_callback(self, event: TelegramCallbackQueryEvent) -> None:
++        """Handle button click callbacks."""
++        # Parse callback data
++        if event.data.startswith("click_"):
++            user_id = event.data[6:]  # Extract user_id
++
++            # Increment click count
++            self.click_counts[user_id] = self.click_counts.get(user_id, 0) + 1
++            count = self.click_counts[user_id]
++
++            # Answer the callback query (shows a toast notification)
++            await event.answer_callback_query(text=f"Button clicked {count} times!")
++
++            # Edit the message with new count
++            result = MessageEventResult()
++            result.message(f"Button clicked {count} times!")
++            result.inline_keyboard(
++                [[{"text": f"Click me ({count})", "callback_data": f"click_{user_id}"}]]
++            )
++            event.set_result(result)
+diff --git a/astrbot/builtin_stars/telegram_keyboard_demo/metadata.yaml b/astrbot/builtin_stars/telegram_keyboard_demo/metadata.yaml
+new file mode 100644
+index 0000000000000000000000000000000000000000..7ae18c1f8b414b9b0e22aa968f8609eba3bf9b24
+--- /dev/null
++++ b/astrbot/builtin_stars/telegram_keyboard_demo/metadata.yaml
+@@ -0,0 +1,4 @@
++name: telegram_keyboard_demo
++desc: Telegram keyboard button demo plugin
++author: AstrBot
++version: 0.0.1
+\ No newline at end of file
+diff --git a/astrbot/core/event_bus.py b/astrbot/core/event_bus.py
+index 70b5f054edf63daf046943f1e145d785f8580b6d..fa349530fb1023ab566846a0de156d0dbcf9a388 100644
+--- a/astrbot/core/event_bus.py
++++ b/astrbot/core/event_bus.py
+@@ -15,7 +15,17 @@ from asyncio import Queue
+ 
+ from astrbot.core import logger
+ from astrbot.core.astrbot_config_mgr import AstrBotConfigManager
++from astrbot.core.message.message_event_result import (
++    CommandResult,
++    MessageChain,
++    MessageEventResult,
++    ResultContentType,
++)
++from astrbot.core.pipeline.context_utils import call_handler
+ from astrbot.core.pipeline.scheduler import PipelineScheduler
++from astrbot.core.star.session_plugin_manager import SessionPluginManager
++from astrbot.core.star.star import star_map
++from astrbot.core.star.star_handler import EventType, star_handlers_registry
+ 
+ from .platform import AstrMessageEvent
+ 
+@@ -41,6 +51,8 @@ class EventBus:
+             conf_id = conf_info["id"]
+             conf_name = conf_info.get("name") or conf_id
+             self._print_event(event, conf_name)
++            if await self._maybe_handle_inline_query(event):
++                continue
+             scheduler = self.pipeline_scheduler_mapping.get(conf_id)
+             if not scheduler:
+                 logger.error(
+@@ -49,6 +61,71 @@ class EventBus:
+                 continue
+             asyncio.create_task(scheduler.execute(event))
+ 
++    async def _maybe_handle_inline_query(self, event: AstrMessageEvent) -> bool:
++        if not hasattr(event, "inline_query_id"):
++            return False
++        if hasattr(event, "inline_message_id"):
++            return False
++
++        query = str(getattr(event, "query", "") or "").strip()
++        conf = self.astrbot_config_mgr.get_conf(event.unified_msg_origin)
++        enabled_plugins_name = conf.get("plugin_set", ["*"])
++        if enabled_plugins_name == ["*"]:
++            event.plugins_name = None
++        else:
++            event.plugins_name = enabled_plugins_name
++
++        handlers = star_handlers_registry.get_handlers_by_event_type(
++            EventType.InlineQueryEvent,
++            plugins_name=event.plugins_name,
++        )
++        handlers = await SessionPluginManager.filter_handlers_by_session(
++            event,
++            handlers,
++        )
++        handled = False
++
++        for handler in handlers:
++            md = star_map.get(handler.handler_module_path)
++            if not md:
++                continue
++            try:
++                wrapper = call_handler(event, handler.handler)
++                async for _ in wrapper:
++                    if await self._dispatch_inline_result(event):
++                        handled = True
++                        break
++                event.clear_result()
++            except Exception as e:
++                logger.error(
++                    f"InlineQuery handler error: {md.name} - {handler.handler_name}: {e}",
++                    exc_info=True,
++                )
++
++            if event.is_stopped():
++                break
++
++        if not handled and query:
++            await event.send(MessageChain().message(query))
++            handled = True
++
++        return True
++
++    async def _dispatch_inline_result(self, event: AstrMessageEvent) -> bool:
++        result = event.get_result()
++        if result is None:
++            return False
++        if isinstance(result, MessageEventResult | CommandResult):
++            if result.result_content_type == ResultContentType.STREAMING_RESULT:
++                if result.async_stream is None:
++                    logger.warning("async_stream 为空，跳过发送。")
++                    return True
++                await event.send_streaming(result.async_stream)
++                return True
++            await event.send(result)
++            return True
++        return False
++
+     def _print_event(self, event: AstrMessageEvent, conf_name: str) -> None:
+         """用于记录事件信息
+ 
+diff --git a/astrbot/core/message/components.py b/astrbot/core/message/components.py
+index 2f19434c9da0c6ffa1b60d0fe13df396fa09e469..e76380aa7f7a831d698425483f968f28c5ee8ac5 100644
+--- a/astrbot/core/message/components.py
++++ b/astrbot/core/message/components.py
+@@ -397,9 +397,11 @@ class Image(BaseMessageComponent):
+     url: str | None = ""
+     # 额外
+     path: str | None = ""
++    file_unique: str | None = ""  # 某些平台可能有图片缓存的唯一标识
++    use_spoiler: bool = False  # Telegram 平台支持剧透图片（模糊显示）
+ 
+-    def __init__(self, file: str | None, **_) -> None:
+-        super().__init__(file=file, **_)
++    def __init__(self, file: str | None, use_spoiler: bool = False, **_) -> None:
++        super().__init__(file=file, use_spoiler=use_spoiler, **_)
+ 
+     @staticmethod
+     def fromURL(url: str, **_):
+diff --git a/astrbot/core/message/message_event_result.py b/astrbot/core/message/message_event_result.py
+index 0965fe7f7fc74a168405063b9e51899cc269f038..37f2a78a58d59956df01e7bd9b05073b5d3a4212 100644
+--- a/astrbot/core/message/message_event_result.py
++++ b/astrbot/core/message/message_event_result.py
+@@ -29,6 +29,8 @@ class MessageChain:
+     use_t2i_: bool | None = None  # None 为跟随用户设置
+     type: str | None = None
+     """消息链承载的消息的类型。可选，用于让消息平台区分不同业务场景的消息链。"""
++    reply_markup: dict | list | None = None
++    # 用于存储 Telegram inline keyboard 数据（dict 或 list 格式）
+ 
+     def message(self, message: str):
+         """添加一条文本消息到消息链 `chain` 中。
+@@ -74,17 +76,22 @@ class MessageChain:
+         self.chain.append(Plain(message))
+         return self
+ 
+-    def url_image(self, url: str):
++    def url_image(self, url: str, use_spoiler: bool = False):
+         """添加一条图片消息（https 链接）到消息链 `chain` 中。
+ 
+         Note:
+             如果需要发送本地图片，请使用 `file_image` 方法。
+ 
++        Args:
++            url: 图片的 URL 地址
++            use_spoiler: 是否将图片标记为剧透（模糊显示），Telegram 平台支持
++
+         Example:
+-            CommandResult().image("https://example.com/image.jpg")
++            CommandResult().url_image("https://example.com/image.jpg")
++            CommandResult().url_image("https://example.com/image.jpg", use_spoiler=True)
+ 
+         """
+-        self.chain.append(Image.fromURL(url))
++        self.chain.append(Image.fromURL(url, use_spoiler=use_spoiler))
+         return self
+ 
+     def file_image(self, path: str):
+@@ -118,6 +125,24 @@ class MessageChain:
+         self.use_t2i_ = use_t2i
+         return self
+ 
++    def inline_keyboard(self, keyboard: list):
++        """设置内联键盘（用于 Telegram 平台）
++
++        Args:
++            keyboard: 键盘按钮列表，格式为二维数组
++                例如: [[{"text": "Button 1", "callback_data": "btn1"}]]
++
++        Returns:
++            self，支持链式调用
++
++        Example:
++            MessageChain().message("Hello").inline_keyboard([
++                [{"text": "Click me", "callback_data": "click"}]
++            ])
++        """
++        self.reply_markup = keyboard
++        return self
++
+     def get_plain_text(self, with_other_comps_mark: bool = False) -> str:
+         """获取纯文本消息。这个方法将获取 chain 中所有 Plain 组件的文本并拼接成一条消息。空格分隔。
+ 
+diff --git a/astrbot/core/pipeline/respond/stage.py b/astrbot/core/pipeline/respond/stage.py
+index aea6a74b3edcbd2189ae03adec16a0f0f9a82432..0636b4f2047d8c60a69f7ca81692c8eb4a7fde19 100644
+--- a/astrbot/core/pipeline/respond/stage.py
++++ b/astrbot/core/pipeline/respond/stage.py
+@@ -131,6 +131,8 @@ class RespondStage(Stage):
+         """检查是否需要分段回复"""
+         if not self.enable_seg:
+             return False
++        if hasattr(event, "inline_query_id"):
++            return False
+ 
+         if (result := event.get_result()) is None:
+             return False
+@@ -241,14 +243,19 @@ class RespondStage(Stage):
+                         f"实际消息链为空, 跳过发送阶段。header_chain: {header_comps}, actual_chain: {result.chain}",
+                     )
+                     return
+-                for comp in result.chain:
++                comps_list = list(result.chain)
++                for idx, comp in enumerate(comps_list):
+                     i = await self._calc_comp_interval(comp)
+                     await asyncio.sleep(i)
++                    is_last = idx == len(comps_list) - 1
+                     try:
+                         if comp.type in need_separately:
+                             await event.send(MessageChain([comp]))
+                         else:
+-                            await event.send(MessageChain([*header_comps, comp]))
++                            reply_markup = result.reply_markup if is_last else None
++                            await event.send(
++                                MessageChain([*header_comps, comp], reply_markup=reply_markup)
++                            )
+                             header_comps.clear()
+                     except Exception as e:
+                         logger.error(
+@@ -279,13 +286,14 @@ class RespondStage(Stage):
+                             f"发送消息链失败: chain = {chain}, error = {e}",
+                             exc_info=True,
+                         )
+-                chain = MessageChain(result.chain)
+                 if result.chain and len(result.chain) > 0:
+                     try:
+-                        await event.send(chain)
++                        await event.send(
++                            MessageChain(result.chain, reply_markup=result.reply_markup)
++                        )
+                     except Exception as e:
+                         logger.error(
+-                            f"发送消息链失败: chain = {chain}, error = {e}",
++                            f"发送消息链失败: chain = {result.chain}, error = {e}",
+                             exc_info=True,
+                         )
+ 
+diff --git a/astrbot/core/pipeline/waking_check/stage.py b/astrbot/core/pipeline/waking_check/stage.py
+index ddc2a6cb8346f712fc2f296de8ff80229ce0e0fb..3ce7e289d62cf8e3e12f411faae80ce52f62b6ff 100644
+--- a/astrbot/core/pipeline/waking_check/stage.py
++++ b/astrbot/core/pipeline/waking_check/stage.py
+@@ -99,6 +99,54 @@ class WakingCheckStage(Stage):
+                 event.role = "admin"
+                 break
+ 
++        # Telegram 回调查询事件：跳过唤醒逻辑，直接分发对应 handler
++        if hasattr(event, "callback_query_id"):
++            enabled_plugins_name = self.ctx.astrbot_config.get("plugin_set", ["*"])
++            if enabled_plugins_name == ["*"]:
++                event.plugins_name = None
++            else:
++                event.plugins_name = enabled_plugins_name
++            logger.debug(f"enabled_plugins_name: {enabled_plugins_name}")
++
++            event.is_wake = True
++            event.is_at_or_wake_command = True
++
++            activated_handlers = star_handlers_registry.get_handlers_by_event_type(
++                EventType.CallbackQueryEvent,
++                plugins_name=event.plugins_name,
++            )
++            activated_handlers = await SessionPluginManager.filter_handlers_by_session(
++                event,
++                activated_handlers,
++            )
++            event.set_extra("activated_handlers", activated_handlers)
++            event.set_extra("handlers_parsed_params", {})
++            return
++
++        # Telegram 选择内联结果事件：跳过唤醒逻辑，直接分发对应 handler
++        if hasattr(event, "result_id") and hasattr(event, "inline_message_id"):
++            enabled_plugins_name = self.ctx.astrbot_config.get("plugin_set", ["*"])
++            if enabled_plugins_name == ["*"]:
++                event.plugins_name = None
++            else:
++                event.plugins_name = enabled_plugins_name
++            logger.debug(f"enabled_plugins_name: {enabled_plugins_name}")
++
++            event.is_wake = True
++            event.is_at_or_wake_command = True
++
++            activated_handlers = star_handlers_registry.get_handlers_by_event_type(
++                EventType.ChosenInlineResultEvent,
++                plugins_name=event.plugins_name,
++            )
++            activated_handlers = await SessionPluginManager.filter_handlers_by_session(
++                event,
++                activated_handlers,
++            )
++            event.set_extra("activated_handlers", activated_handlers)
++            event.set_extra("handlers_parsed_params", {})
++            return
++
+         # 检查 wake
+         wake_prefixes = self.ctx.astrbot_config["wake_prefix"]
+         messages = event.get_messages()
+diff --git a/astrbot/core/platform/sources/telegram/tg_adapter.py b/astrbot/core/platform/sources/telegram/tg_adapter.py
+index a37e5cfd4160378125cf41ca08726d9e9e91ff59..1aa5584d4f1452733fb49db9ae7c92b93305da7b 100644
+--- a/astrbot/core/platform/sources/telegram/tg_adapter.py
++++ b/astrbot/core/platform/sources/telegram/tg_adapter.py
+@@ -10,7 +10,15 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
+ from telegram import BotCommand, Update
+ from telegram.constants import ChatType
+ from telegram.error import Forbidden, InvalidToken, NetworkError
+-from telegram.ext import ApplicationBuilder, ContextTypes, ExtBot, filters
++from telegram.ext import (
++    ApplicationBuilder,
++    CallbackQueryHandler,
++    ChosenInlineResultHandler,
++    ContextTypes,
++    ExtBot,
++    InlineQueryHandler,
++    filters,
++)
+ from telegram.ext import MessageHandler as TelegramMessageHandler
+ 
+ import astrbot.api.message_components as Comp
+@@ -33,7 +41,12 @@ from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
+ from astrbot.core.utils.io import download_file
+ from astrbot.core.utils.media_utils import convert_audio_to_wav
+ 
+-from .tg_event import TelegramPlatformEvent
++from .tg_event import (
++    TelegramCallbackQueryEvent,
++    TelegramChosenInlineResultEvent,
++    TelegramInlineQueryEvent,
++    TelegramPlatformEvent,
++)
+ 
+ if sys.version_info >= (3, 12):
+     from typing import override
+@@ -132,6 +145,15 @@ class TelegramPlatformAdapter(Platform):
+             callback=self.message_handler,
+         )
+         self.application.add_handler(message_handler)
++        self.application.add_handler(
++            InlineQueryHandler(callback=self.inline_query_handler)
++        )
++        self.application.add_handler(
++            ChosenInlineResultHandler(callback=self.chosen_inline_result_handler)
++        )
++        self.application.add_handler(
++            CallbackQueryHandler(callback=self.callback_query_handler)
++        )
+         self.client = self.application.bot
+         logger.debug(f"Telegram base url: {self.client.base_url}")
+ 
+@@ -731,6 +753,69 @@ class TelegramPlatformAdapter(Platform):
+         )
+         self.commit_event(message_event)
+ 
++    async def inline_query_handler(
++        self, update: Update, context: ContextTypes.DEFAULT_TYPE
++    ) -> None:
++        """处理 Telegram 内联查询"""
++        if not update.inline_query:
++            return
++
++        inline_query_event = TelegramInlineQueryEvent(
++            query=update.inline_query.query,
++            from_user_id=str(update.inline_query.from_user.id),
++            inline_query_id=update.inline_query.id,
++            offset=update.inline_query.offset,
++            platform_meta=self.meta(),
++            session_id=str(
++                update.inline_query.from_user.id
++            ),  # 使用用户ID作为session_id
++            client=self.client,
++        )
++        self.commit_event(inline_query_event)
++
++    async def chosen_inline_result_handler(
++        self, update: Update, context: ContextTypes.DEFAULT_TYPE
++    ) -> None:
++        """处理 Telegram 选择内联结果"""
++        if not update.chosen_inline_result:
++            return
++
++        chosen_result_event = TelegramChosenInlineResultEvent(
++            result_id=update.chosen_inline_result.result_id,
++            from_user_id=str(update.chosen_inline_result.from_user.id),
++            query=update.chosen_inline_result.query,
++            inline_message_id=getattr(
++                update.chosen_inline_result, "inline_message_id", None
++            ),
++            platform_meta=self.meta(),
++            session_id=str(
++                update.chosen_inline_result.from_user.id
++            ),  # 使用用户ID作为session_id
++            client=self.client,
++        )
++        self.commit_event(chosen_result_event)
++
++    async def callback_query_handler(
++        self, update: Update, context: ContextTypes.DEFAULT_TYPE
++    ) -> None:
++        """处理 Telegram 回调查询（键盘按钮点击）"""
++        if not update.callback_query:
++            return
++
++        callback_event = TelegramCallbackQueryEvent(
++            callback_query_id=update.callback_query.id,
++            data=update.callback_query.data or "",
++            from_user_id=str(update.callback_query.from_user.id),
++            message=update.callback_query.message,
++            inline_message_id=getattr(
++                update.callback_query, "inline_message_id", None
++            ),
++            platform_meta=self.meta(),
++            session_id=str(update.callback_query.from_user.id),
++            client=self.client,
++        )
++        self.commit_event(callback_event)
++
+     def get_client(self) -> ExtBot:
+         return self.client
+ 
+diff --git a/astrbot/core/platform/sources/telegram/tg_event.py b/astrbot/core/platform/sources/telegram/tg_event.py
+index 8445a8ea1ea0515a9c0bd43b7acc5709a0f14649..2f831d151b11b04692c151433dc1772a8663bfd6 100644
+--- a/astrbot/core/platform/sources/telegram/tg_event.py
++++ b/astrbot/core/platform/sources/telegram/tg_event.py
+@@ -1,11 +1,20 @@
+ import asyncio
++import hashlib
++import inspect
+ import os
+ import re
+ from collections.abc import Callable
+ from typing import Any, cast
+ 
+ import telegramify_markdown
+-from telegram import ReactionTypeCustomEmoji, ReactionTypeEmoji
++from telegram import (
++    InlineKeyboardButton,
++    InlineKeyboardMarkup,
++    InlineQueryResultArticle,
++    InputTextMessageContent,
++    ReactionTypeCustomEmoji,
++    ReactionTypeEmoji,
++)
+ from telegram.constants import ChatAction
+ from telegram.error import BadRequest
+ from telegram.ext import ExtBot
+@@ -272,8 +281,6 @@ class TelegramPlatformEvent(AstrMessageEvent):
+         message: MessageChain,
+         user_name: str,
+     ) -> None:
+-        image_path = None
+-
+         has_reply = False
+         reply_message_id = None
+         at_user_id = None
+@@ -284,17 +291,56 @@ class TelegramPlatformEvent(AstrMessageEvent):
+             if isinstance(i, At):
+                 at_user_id = i.name
+ 
++        # Handle reply_markup (inline keyboard)
++        reply_markup_keyboard = None
++        if hasattr(message, "reply_markup") and message.reply_markup:
++            try:
++                keyboard_buttons = []
++                for row in message.reply_markup:
++                    button_row = []
++                    for button in row:
++                        button_row.append(InlineKeyboardButton(**button))
++                    keyboard_buttons.append(button_row)
++                reply_markup_keyboard = InlineKeyboardMarkup(keyboard_buttons)
++            except Exception as e:
++                logger.warning(
++                    f"Failed to convert reply_markup to InlineKeyboardMarkup: {e}"
++                )
++
+         at_flag = False
+         message_thread_id = None
+         if "#" in user_name:
+             # it's a supergroup chat with message_thread_id
+             user_name, message_thread_id = user_name.split("#")
+ 
+-        # 根据消息链确定合适的 chat action 并发送
++        plain_texts: list[str] = []
++        images: list[Image] = []
++        videos: list[Video] = []
++        files: list[File] = []
++        records: list[Record] = []
++
++        for i in message.chain:
++            if isinstance(i, Plain):
++                if at_user_id and not at_flag:
++                    plain_texts.append(f"@{at_user_id} {i.text}")
++                    at_flag = True
++                else:
++                    plain_texts.append(i.text)
++            elif isinstance(i, Image):
++                images.append(i)
++            elif isinstance(i, Video):
++                videos.append(i)
++            elif isinstance(i, File):
++                files.append(i)
++            elif isinstance(i, Record):
++                records.append(i)
++
++        full_text = " ".join(plain_texts) if plain_texts else None
++
+         action = cls._get_chat_action_for_chain(message.chain)
+         await cls._send_chat_action(client, user_name, action, message_thread_id)
+ 
+-        for i in message.chain:
++        def get_base_payload() -> dict:
+             payload = {
+                 "chat_id": user_name,
+             }
+@@ -302,44 +348,165 @@ class TelegramPlatformEvent(AstrMessageEvent):
+                 payload["reply_to_message_id"] = str(reply_message_id)
+             if message_thread_id:
+                 payload["message_thread_id"] = message_thread_id
++            return payload
++
++        if images:
++            first_image = images[0]
++            image_path = await first_image.convert_to_file_path()
++            payload = get_base_payload()
++            if full_text:
++                # Telegram caption 限制 1024 字符
++                caption = full_text[:1024] if len(full_text) > 1024 else full_text
++                try:
++                    caption = telegramify_markdown.markdownify(caption)
++                    payload["parse_mode"] = "MarkdownV2"
++                except Exception as e:
++                    logger.warning(f"Caption markdownify failed: {e}, using plain text")
++                if _is_gif(image_path):
++                    await client.send_animation(
++                        animation=image_path,
++                        caption=caption,
++                        **cast(Any, payload),
++                    )
++                else:
++                    await client.send_photo(
++                        photo=image_path,
++                        caption=caption,
++                        has_spoiler=first_image.use_spoiler,
++                        **cast(Any, payload),
++                    )
++            else:
++                if _is_gif(image_path):
++                    await client.send_animation(
++                        animation=image_path,
++                        **cast(Any, payload),
++                    )
++                else:
++                    await client.send_photo(
++                        photo=image_path,
++                        has_spoiler=first_image.use_spoiler,
++                        **cast(Any, payload),
++                    )
+ 
+-            if isinstance(i, Plain):
+-                if at_user_id and not at_flag:
+-                    i.text = f"@{at_user_id} {i.text}"
+-                    at_flag = True
+-                await cls._send_text_chunks(client, i.text, payload)
+-            elif isinstance(i, Image):
+-                image_path = await i.convert_to_file_path()
++            for img in images[1:]:
++                image_path = await img.convert_to_file_path()
++                payload = get_base_payload()
+                 if _is_gif(image_path):
+-                    send_coro = client.send_animation
+-                    media_kwarg = {"animation": image_path}
++                    await client.send_animation(
++                        animation=image_path,
++                        **cast(Any, payload),
++                    )
+                 else:
+-                    send_coro = client.send_photo
+-                    media_kwarg = {"photo": image_path}
+-                await send_coro(**media_kwarg, **cast(Any, payload))
+-            elif isinstance(i, File):
+-                path = await i.get_file()
+-                name = i.name or os.path.basename(path)
+-                await client.send_document(
+-                    document=path, filename=name, **cast(Any, payload)
+-                )
+-            elif isinstance(i, Record):
+-                path = await i.convert_to_file_path()
+-                await cls._send_voice_with_fallback(
+-                    client,
+-                    path,
+-                    payload,
+-                    caption=i.text or None,
+-                    use_media_action=False,
+-                )
+-            elif isinstance(i, Video):
+-                path = await i.convert_to_file_path()
++                    await client.send_photo(
++                        photo=image_path,
++                        has_spoiler=img.use_spoiler,
++                        **cast(Any, payload),
++                    )
++
++            if full_text and len(full_text) > 1024:
++                remaining_text = full_text[1024:]
++                chunks = cls._split_message(remaining_text)
++                for chunk in chunks:
++                    payload = get_base_payload()
++                    payload["disable_web_page_preview"] = True
++                    try:
++                        md_text = telegramify_markdown.markdownify(chunk)
++                        await client.send_message(
++                            text=md_text,
++                            parse_mode="MarkdownV2",
++                            **cast(Any, payload),
++                        )
++                    except Exception as e:
++                        logger.warning(
++                            f"MarkdownV2 send failed: {e}. Using plain text instead.",
++                        )
++                        await client.send_message(text=chunk, **cast(Any, payload))
++        elif videos:
++            first_video = videos[0]
++            path = await first_video.convert_to_file_path()
++            payload = get_base_payload()
++            caption = getattr(first_video, "text", None) or full_text
++            if caption:
++                caption = caption[:1024] if len(caption) > 1024 else caption
++                try:
++                    caption = telegramify_markdown.markdownify(caption)
++                    payload["parse_mode"] = "MarkdownV2"
++                except Exception as e:
++                    logger.warning(f"Caption markdownify failed: {e}")
++            await client.send_video(
++                video=path,
++                caption=caption,
++                **cast(Any, payload),
++            )
++
++            for vid in videos[1:]:
++                path = await vid.convert_to_file_path()
++                payload = get_base_payload()
+                 await client.send_video(
+                     video=path,
+-                    caption=getattr(i, "text", None) or None,
++                    caption=getattr(vid, "text", None),
+                     **cast(Any, payload),
+                 )
+ 
++            if full_text and len(full_text) > 1024:
++                remaining_text = full_text[1024:]
++                chunks = cls._split_message(remaining_text)
++                for chunk in chunks:
++                    payload = get_base_payload()
++                    try:
++                        md_text = telegramify_markdown.markdownify(chunk)
++                        await client.send_message(
++                            text=md_text,
++                            parse_mode="MarkdownV2",
++                            **cast(Any, payload),
++                        )
++                    except Exception as e:
++                        logger.warning(
++                            f"MarkdownV2 send failed: {e}. Using plain text instead.",
++                        )
++                        await client.send_message(text=chunk, **cast(Any, payload))
++        elif full_text:
++            chunks = cls._split_message(full_text)
++            for i, chunk in enumerate(chunks):
++                payload = get_base_payload()
++                payload["disable_web_page_preview"] = True
++                try:
++                    md_text = telegramify_markdown.markdownify(chunk)
++                    await client.send_message(
++                        text=md_text,
++                        parse_mode="MarkdownV2",
++                        reply_markup=reply_markup_keyboard if i == 0 else None,
++                        **cast(Any, payload),
++                    )
++                except Exception as e:
++                    logger.warning(
++                        f"MarkdownV2 send failed: {e}. Using plain text instead.",
++                    )
++                    await client.send_message(
++                        text=chunk,
++                        reply_markup=reply_markup_keyboard if i == 0 else None,
++                        **cast(Any, payload),
++                    )
++
++        for f in files:
++            payload = get_base_payload()
++            path = await f.get_file()
++            name = f.name or os.path.basename(path)
++            await client.send_document(
++                document=path, filename=name, **cast(Any, payload)
++            )
++
++        for r in records:
++            payload = get_base_payload()
++            path = await r.convert_to_file_path()
++            await cls._send_voice_with_fallback(
++                client,
++                path,
++                payload,
++                caption=r.text or None,
++                use_media_action=False,
++            )
++
+     async def send(self, message: MessageChain) -> None:
+         if self.get_message_type() == MessageType.GROUP_MESSAGE:
+             await self.send_with_client(self.client, message, self.message_obj.group_id)
+@@ -733,3 +900,582 @@ class TelegramPlatformEvent(AstrMessageEvent):
+                     )
+         except Exception as e:
+             logger.warning(f"编辑消息失败(streaming): {e!s}")
++
++
++class TelegramInlineQueryEvent(AstrMessageEvent):
++    """Telegram 内联查询事件"""
++
++    MAX_INLINE_RESULTS = 50
++    MAX_INLINE_DESCRIPTION_LEN = 100
++    _INLINE_ARTICLE_PARAMS: set[str] | None = None
++
++    def __init__(
++        self,
++        query: str,
++        from_user_id: str,
++        inline_query_id: str,
++        offset: str,
++        platform_meta: PlatformMetadata,
++        session_id: str,
++        client: ExtBot,
++    ) -> None:
++        self.query = query
++        """内联查询的文本"""
++        self.from_user_id = from_user_id
++        """发起查询的用户ID"""
++        self.inline_query_id = inline_query_id
++        """内联查询的唯一ID"""
++        self.offset = offset
++        """分页偏移量"""
++        self.client = client
++        self._inline_answer_seq = 0
++        self._bot_thumb_url: str | None = None
++
++        # 创建一个虚拟的 AstrBotMessage 用于兼容性
++        from astrbot.api.platform import AstrBotMessage, MessageType
++
++        message_obj = AstrBotMessage()
++        message_obj.message = [Plain(query)] if query else []
++        message_obj.type = MessageType.OTHER_MESSAGE  # 内联查询视为系统消息
++        message_obj.sender = from_user_id
++
++        super().__init__(
++            message_str=query,
++            message_obj=message_obj,
++            platform_meta=platform_meta,
++            session_id=session_id,
++        )
++
++    def get_sender_id(self) -> str:
++        return self.from_user_id
++
++    def get_sender_name(self) -> str:
++        return self.from_user_id  # Telegram 用户名可能不可用
++
++    def get_message_type(self) -> MessageType:
++        return MessageType.OTHER_MESSAGE
++
++    def _chain_to_text(self, message_chain: MessageChain) -> str:
++        text = message_chain.get_plain_text(with_other_comps_mark=True)
++        return text.strip()
++
++    async def _get_bot_thumb_url(self) -> str | None:
++        if self._bot_thumb_url is not None:
++            return self._bot_thumb_url
++        try:
++            me = await self.client.get_me()
++            photos = await self.client.get_user_profile_photos(me.id, limit=1)
++            if photos.total_count <= 0:
++                self._bot_thumb_url = ""
++                return None
++            first_photo = photos.photos[0][-1]
++            file_obj = await self.client.get_file(first_photo.file_id)
++            url = getattr(file_obj, "file_path", None)
++            if isinstance(url, str) and url:
++                self._bot_thumb_url = url
++                return url
++        except Exception as e:
++            logger.debug(f"获取 bot 头像失败: {e!s}")
++        self._bot_thumb_url = ""
++        return None
++
++    async def _build_inline_results(self, text: str) -> list[InlineQueryResultArticle]:
++        if not text:
++            return []
++        chunks = TelegramPlatformEvent._split_message(text)
++        thumb_url = "https://user-images.githubusercontent.com/11541888/223106202-7576ff11-2c8e-408d-94ea-b02a7a32149a.png"
++        if self._INLINE_ARTICLE_PARAMS is None:
++            try:
++                self._INLINE_ARTICLE_PARAMS = set(
++                    inspect.signature(InlineQueryResultArticle).parameters.keys(),
++                )
++            except Exception:
++                self._INLINE_ARTICLE_PARAMS = set()
++        results: list[InlineQueryResultArticle] = []
++        for idx, chunk in enumerate(chunks[: self.MAX_INLINE_RESULTS]):
++            raw_id = f"{self.inline_query_id}:{self._inline_answer_seq}:{idx}"
++            hashed = hashlib.blake2b(raw_id.encode("utf-8"), digest_size=6).hexdigest()
++            result_id = f"ab-{hashed}"
++            title = "AstrBot"
++            description = chunk.replace("\n", " ").strip()
++            if len(description) > self.MAX_INLINE_DESCRIPTION_LEN:
++                description = description[: self.MAX_INLINE_DESCRIPTION_LEN - 1] + "…"
++            kwargs = {
++                "id": result_id,
++                "title": title,
++                "description": description,
++                "input_message_content": InputTextMessageContent(
++                    message_text=chunk[: TelegramPlatformEvent.MAX_MESSAGE_LENGTH],
++                ),
++                "reply_markup": InlineKeyboardMarkup(
++                    [
++                        [
++                            InlineKeyboardButton(
++                                "Bot正在思考 🤖", callback_data="astrbot_thinking"
++                            )
++                        ]
++                    ],
++                ),
++            }
++            if thumb_url:
++                if "thumb_url" in self._INLINE_ARTICLE_PARAMS:
++                    kwargs["thumb_url"] = thumb_url
++                elif "thumbnail_url" in self._INLINE_ARTICLE_PARAMS:
++                    kwargs["thumbnail_url"] = thumb_url
++            results.append(
++                InlineQueryResultArticle(**kwargs),
++            )
++        return results
++
++    async def _answer_inline_query(self, text: str) -> None:
++        results = await self._build_inline_results(text)
++        if not results:
++            logger.warning(
++                "TelegramInlineQueryEvent 空结果，跳过 answer_inline_query。"
++            )
++            return
++        self._inline_answer_seq += 1
++        try:
++            await self.client.answer_inline_query(
++                inline_query_id=self.inline_query_id,
++                results=results,
++                cache_time=0,
++                is_personal=True,
++            )
++        except Exception as e:
++            logger.warning(f"answer_inline_query 失败: {e!s}")
++
++    async def send_with_client(
++        self, client: ExtBot, message_chain: MessageChain, user_name: str
++    ) -> None:
++        """内联查询通过 answer_inline_query 响应"""
++        _ = client
++        _ = user_name
++        text = self._chain_to_text(message_chain)
++        if not text:
++            logger.warning("TelegramInlineQueryEvent 消息为空，跳过发送。")
++            return
++        await self._answer_inline_query(text)
++
++    async def send(self, message: MessageChain) -> None:
++        await self.send_with_client(self.client, message, self.get_sender_id())
++        await super().send(message)
++
++    async def send_streaming(self, generator, use_fallback: bool = False):
++        if not self.inline_query_id:
++            logger.warning(
++                "TelegramInlineQueryEvent 缺少 inline_query_id，无法流式响应。"
++            )
++            return
++        delta = ""
++        last_send_time = 0.0
++        throttle_interval = 0.6
++        loop = asyncio.get_running_loop()
++
++        async for chain in generator:
++            if not isinstance(chain, MessageChain):
++                continue
++            if chain.type == "break":
++                if delta:
++                    await self._answer_inline_query(delta)
++                delta = ""
++                continue
++            delta += chain.get_plain_text(with_other_comps_mark=True)
++            now = loop.time()
++            if now - last_send_time >= throttle_interval:
++                await self._answer_inline_query(delta)
++                last_send_time = now
++
++        if delta:
++            await self._answer_inline_query(delta)
++
++        await super().send_streaming(generator, use_fallback)
++
++
++class TelegramChosenInlineResultEvent(AstrMessageEvent):
++    """Telegram 选择内联结果事件"""
++
++    def __init__(
++        self,
++        result_id: str,
++        from_user_id: str,
++        query: str,
++        inline_message_id: str | None,
++        platform_meta: PlatformMetadata,
++        session_id: str,
++        client: ExtBot,
++    ) -> None:
++        self.result_id = result_id
++        """被选择的结果ID"""
++        self.from_user_id = from_user_id
++        """选择结果的用户ID"""
++        self.query = query
++        """原始查询文本"""
++        self.inline_message_id = inline_message_id
++        """内联消息ID（如果适用）"""
++        self.client = client
++
++        # 创建一个虚拟的 AstrBotMessage 用于兼容性
++        from astrbot.api.platform import AstrBotMessage, MessageType
++
++        message_obj = AstrBotMessage()
++        message_obj.message = [Plain(query)] if query else []
++        message_obj.type = MessageType.OTHER_MESSAGE  # 选择结果视为系统消息
++        message_obj.sender = from_user_id
++
++        super().__init__(
++            message_str=query,
++            message_obj=message_obj,
++            platform_meta=platform_meta,
++            session_id=session_id,
++        )
++
++    def get_sender_id(self) -> str:
++        return self.from_user_id
++
++    def get_sender_name(self) -> str:
++        return self.from_user_id  # Telegram 用户名可能不可用
++
++    def get_message_type(self) -> MessageType:
++        return MessageType.OTHER_MESSAGE
++
++    def _chain_to_text(self, message_chain: MessageChain) -> str:
++        text = message_chain.get_plain_text(with_other_comps_mark=True)
++        return text.strip()
++
++    async def _edit_inline_message(
++        self, text: str, parse_mode: str | None = None, reply_markup=None
++    ) -> None:
++        if not self.inline_message_id:
++            logger.debug(
++                "TelegramChosenInlineResultEvent 缺少 inline_message_id，跳过编辑。"
++            )
++            return
++        try:
++            await self.client.edit_message_text(
++                text=text[: TelegramPlatformEvent.MAX_MESSAGE_LENGTH],
++                inline_message_id=self.inline_message_id,
++                parse_mode=parse_mode,
++                reply_markup=reply_markup,
++            )
++        except Exception as e:
++            logger.warning(f"编辑内联消息失败: {e!s}")
++
++    async def send_with_client(
++        self, client: ExtBot, message_chain: MessageChain, user_name: str
++    ) -> None:
++        _ = client
++        _ = user_name
++        text = self._chain_to_text(message_chain)
++        if not text:
++            logger.warning("TelegramChosenInlineResultEvent 消息为空，跳过发送。")
++            return
++
++        reply_markup_keyboard = None
++        if hasattr(message_chain, "reply_markup") and message_chain.reply_markup:
++            try:
++                keyboard_buttons = []
++                for row in message_chain.reply_markup:
++                    button_row = []
++                    for button in row:
++                        button_row.append(InlineKeyboardButton(**button))
++                    keyboard_buttons.append(button_row)
++                reply_markup_keyboard = InlineKeyboardMarkup(keyboard_buttons)
++            except Exception as e:
++                logger.warning(
++                    f"Failed to convert reply_markup to InlineKeyboardMarkup: {e}"
++                )
++
++        try:
++            markdown_text = telegramify_markdown.markdownify(text)
++            await self._edit_inline_message(
++                markdown_text, parse_mode="MarkdownV2", reply_markup=reply_markup_keyboard
++            )
++        except Exception as e:
++            logger.warning(f"Markdown转换失败，使用普通文本: {e!s}")
++            await self._edit_inline_message(text, reply_markup=reply_markup_keyboard)
++
++    async def send(self, message: MessageChain) -> None:
++        await self.send_with_client(self.client, message, self.get_sender_id())
++        await super().send(message)
++
++    async def send_streaming(self, generator, use_fallback: bool = False):
++        if not self.inline_message_id:
++            logger.warning(
++                "TelegramChosenInlineResultEvent 缺少 inline_message_id，无法流式编辑消息。"
++            )
++            return
++
++        delta = ""
++        current_content = ""
++        last_edit_time = 0.0
++        throttle_interval = 0.6
++        loop = asyncio.get_running_loop()
++        reply_markup_keyboard = None
++
++        async for chain in generator:
++            if not isinstance(chain, MessageChain):
++                continue
++            if chain.type == "break":
++                delta += "\n"
++                continue
++
++            if hasattr(chain, "reply_markup") and chain.reply_markup:
++                try:
++                    keyboard_buttons = []
++                    for row in chain.reply_markup:
++                        button_row = []
++                        for button in row:
++                            button_row.append(InlineKeyboardButton(**button))
++                        keyboard_buttons.append(button_row)
++                    reply_markup_keyboard = InlineKeyboardMarkup(keyboard_buttons)
++                except Exception as e:
++                    logger.warning(
++                        f"Failed to convert reply_markup to InlineKeyboardMarkup: {e}"
++                    )
++
++            delta += chain.get_plain_text(with_other_comps_mark=True)
++            now = loop.time()
++            if now - last_edit_time >= throttle_interval:
++                await self._edit_inline_message(delta)
++                current_content = delta
++                last_edit_time = now
++
++        try:
++            if delta and current_content != delta:
++                try:
++                    markdown_text = telegramify_markdown.markdownify(delta)
++                    await self._edit_inline_message(
++                        markdown_text,
++                        parse_mode="MarkdownV2",
++                        reply_markup=reply_markup_keyboard,
++                    )
++                except Exception as e:
++                    logger.warning(f"Markdown转换失败，使用普通文本: {e!s}")
++                    await self._edit_inline_message(delta, reply_markup=reply_markup_keyboard)
++        except Exception as e:
++            logger.warning(f"编辑消息失败(streaming): {e!s}")
++
++        await super().send_streaming(generator, use_fallback)
++
++
++class TelegramCallbackQueryEvent(AstrMessageEvent):
++    """Telegram 回调查询事件（键盘按钮点击）"""
++
++    def __init__(
++        self,
++        callback_query_id: str,
++        data: str,
++        from_user_id: str,
++        message: object | None,
++        inline_message_id: str | None,
++        platform_meta: PlatformMetadata,
++        session_id: str,
++        client: ExtBot,
++    ) -> None:
++        self.callback_query_id = callback_query_id
++        """回调查询ID"""
++        self.data = data
++        """回调数据"""
++        self.from_user_id = from_user_id
++        """点击按钮的用户ID"""
++        self.message = message
++        """消息对象（内联模式下可能为 None）"""
++        self.inline_message_id = inline_message_id
++        """内联消息ID（内联模式下使用）"""
++        self.client = client
++
++        # 创建一个虚拟的 AstrBotMessage 用于兼容性
++        from astrbot.api.platform import AstrBotMessage, MessageType
++
++        message_obj = AstrBotMessage()
++        message_obj.message = [Plain(data)] if data else []
++        message_obj.type = MessageType.FRIEND_MESSAGE
++        message_obj.sender = from_user_id
++
++        super().__init__(
++            message_str=data,
++            message_obj=message_obj,
++            platform_meta=platform_meta,
++            session_id=session_id,
++        )
++
++        # 阻止 LLM 处理：回调事件仅由插件处理
++        self.call_llm = True
++
++    def get_sender_id(self) -> str:
++        return self.from_user_id
++
++    def get_sender_name(self) -> str:
++        return self.from_user_id
++
++    def get_message_type(self) -> MessageType:
++        return MessageType.FRIEND_MESSAGE
++
++    def _chain_to_text(self, message_chain: MessageChain) -> str:
++        text = message_chain.get_plain_text(with_other_comps_mark=True)
++        return text.strip()
++
++    async def answer_callback_query(
++        self,
++        text: str | None = None,
++        show_alert: bool = False,
++        url: str | None = None,
++        cache_time: int | None = None,
++    ) -> bool:
++        """回应回调查询，可选显示提示消息
++
++        Args:
++            text: 显示给用户的文本
++            show_alert: 是否显示为弹窗而非通知
++            url: 打开的 URL
++            cache_time: 缓存时间（秒）
++
++        Returns:
++            是否成功
++        """
++        try:
++            await self.client.answer_callback_query(
++                callback_query_id=self.callback_query_id,
++                text=text,
++                show_alert=show_alert,
++                url=url,
++                cache_time=cache_time,
++            )
++            return True
++        except Exception as e:
++            logger.warning(f"回应回调查询失败: {e!s}")
++            return False
++
++    async def _edit_message(
++        self, text: str, parse_mode: str | None = None, reply_markup=None
++    ) -> None:
++        """编辑消息（普通消息或内联消息）
++
++        Args:
++            text: 消息文本
++            parse_mode: 解析模式（如 MarkdownV2）
++            reply_markup: 内联键盘（InlineKeyboardMarkup）
++        """
++        if self.inline_message_id:
++            try:
++                await self.client.edit_message_text(
++                    text=text[: TelegramPlatformEvent.MAX_MESSAGE_LENGTH],
++                    inline_message_id=self.inline_message_id,
++                    parse_mode=parse_mode,
++                    reply_markup=reply_markup,
++                )
++            except Exception as e:
++                logger.warning(f"编辑内联消息失败: {e!s}")
++        elif self.message:
++            try:
++                chat_id = self.message.chat.id
++                message_id = self.message.message_id
++                await self.client.edit_message_text(
++                    text=text[: TelegramPlatformEvent.MAX_MESSAGE_LENGTH],
++                    chat_id=chat_id,
++                    message_id=message_id,
++                    parse_mode=parse_mode,
++                    reply_markup=reply_markup,
++                )
++            except Exception as e:
++                logger.warning(f"编辑消息失败: {e!s}")
++        else:
++            logger.debug("TelegramCallbackQueryEvent 无可用消息，跳过编辑。")
++
++    async def send_with_client(
++        self, client: ExtBot, message_chain: MessageChain, user_name: str
++    ) -> None:
++        _ = client
++        _ = user_name
++        text = self._chain_to_text(message_chain)
++        if not text:
++            logger.warning("TelegramCallbackQueryEvent 消息为空，跳过发送。")
++            return
++
++        reply_markup_keyboard = None
++        if hasattr(message_chain, "reply_markup") and message_chain.reply_markup:
++            try:
++                keyboard_buttons = []
++                for row in message_chain.reply_markup:
++                    button_row = []
++                    for button in row:
++                        button_row.append(InlineKeyboardButton(**button))
++                    keyboard_buttons.append(button_row)
++                reply_markup_keyboard = InlineKeyboardMarkup(keyboard_buttons)
++            except Exception as e:
++                logger.warning(
++                    f"Failed to convert reply_markup to InlineKeyboardMarkup: {e}"
++                )
++
++        try:
++            markdown_text = telegramify_markdown.markdownify(text)
++            await self._edit_message(
++                markdown_text, parse_mode="MarkdownV2", reply_markup=reply_markup_keyboard
++            )
++        except Exception as e:
++            logger.warning(f"Markdown转换失败，使用普通文本: {e!s}")
++            await self._edit_message(text, reply_markup=reply_markup_keyboard)
++
++    async def send(self, message: MessageChain) -> None:
++        await self.send_with_client(self.client, message, self.get_sender_id())
++        await super().send(message)
++
++    async def send_streaming(self, generator, use_fallback: bool = False):
++        if not self.message and not self.inline_message_id:
++            logger.warning(
++                "TelegramCallbackQueryEvent 缺少 message 和 inline_message_id，无法流式编辑消息。"
++            )
++            return
++
++        delta = ""
++        current_content = ""
++        last_edit_time = 0.0
++        throttle_interval = 0.6
++        loop = asyncio.get_running_loop()
++        reply_markup_keyboard = None
++
++        async for chain in generator:
++            if not isinstance(chain, MessageChain):
++                continue
++            if chain.type == "break":
++                delta += "\n"
++                continue
++
++            if hasattr(chain, "reply_markup") and chain.reply_markup:
++                try:
++                    keyboard_buttons = []
++                    for row in chain.reply_markup:
++                        button_row = []
++                        for button in row:
++                            button_row.append(InlineKeyboardButton(**button))
++                        keyboard_buttons.append(button_row)
++                    reply_markup_keyboard = InlineKeyboardMarkup(keyboard_buttons)
++                except Exception as e:
++                    logger.warning(
++                        f"Failed to convert reply_markup to InlineKeyboardMarkup: {e}"
++                    )
++
++            delta += chain.get_plain_text(with_other_comps_mark=True)
++            now = loop.time()
++            if now - last_edit_time >= throttle_interval:
++                await self._edit_message(delta)
++                current_content = delta
++                last_edit_time = now
++
++        try:
++            if delta and current_content != delta:
++                try:
++                    markdown_text = telegramify_markdown.markdownify(delta)
++                    await self._edit_message(
++                        markdown_text,
++                        parse_mode="MarkdownV2",
++                        reply_markup=reply_markup_keyboard,
++                    )
++                except Exception as e:
++                    logger.warning(f"Markdown转换失败，使用普通文本: {e!s}")
++                    await self._edit_message(delta, reply_markup=reply_markup_keyboard)
++        except Exception as e:
++            logger.warning(f"编辑消息失败(streaming): {e!s}")
++
++        await super().send_streaming(generator, use_fallback)
+diff --git a/astrbot/core/star/register/__init__.py b/astrbot/core/star/register/__init__.py
+index 2363c722ac93cccf3ed9dba6223e5b0f5ed12c79..56204d513e23666bdca3d278d8ff30f9b32ecf25 100644
+--- a/astrbot/core/star/register/__init__.py
++++ b/astrbot/core/star/register/__init__.py
+@@ -2,10 +2,13 @@ from .star import register_star
+ from .star_handler import (
+     register_after_message_sent,
+     register_agent,
++    register_callback_query,
++    register_chosen_inline_result,
+     register_command,
+     register_command_group,
+     register_custom_filter,
+     register_event_message_type,
++    register_inline_query,
+     register_llm_tool,
+     register_on_agent_begin,
+     register_on_agent_done,
+@@ -28,10 +31,13 @@ from .star_handler import (
+ __all__ = [
+     "register_after_message_sent",
+     "register_agent",
++    "register_callback_query",
++    "register_chosen_inline_result",
+     "register_command",
+     "register_command_group",
+     "register_custom_filter",
+     "register_event_message_type",
++    "register_inline_query",
+     "register_llm_tool",
+     "register_on_agent_begin",
+     "register_on_agent_done",
+diff --git a/astrbot/core/star/register/star_handler.py b/astrbot/core/star/register/star_handler.py
+index 10417c40130b61b90ff323f5e3b0a28d5ffe5cd7..ae0307a672e378a48305c80bd0a866575ded5a9e 100644
+--- a/astrbot/core/star/register/star_handler.py
++++ b/astrbot/core/star/register/star_handler.py
+@@ -737,3 +737,58 @@ def register_after_message_sent(**kwargs):
+         return awaitable
+ 
+     return decorator
++
++
++def register_inline_query(**kwargs):
++    """注册 Telegram 内联查询事件处理器
++
++    Hook 参数:
++        event: TelegramInlineQueryEvent
++
++    说明:
++        当用户在 Telegram 中输入 @botname query 时触发
++    """
++
++    def decorator(awaitable):
++        _ = get_handler_or_create(awaitable, EventType.InlineQueryEvent, **kwargs)
++        return awaitable
++
++    return decorator
++
++
++def register_chosen_inline_result(**kwargs):
++    """注册 Telegram 选择内联结果事件处理器
++
++    Hook 参数:
++        event: TelegramChosenInlineResultEvent
++
++    说明:
++        当用户选择了一个内联查询结果时触发
++    """
++
++    def decorator(awaitable):
++        _ = get_handler_or_create(
++            awaitable, EventType.ChosenInlineResultEvent, **kwargs
++        )
++        return awaitable
++
++    return decorator
++
++
++def register_callback_query(**kwargs):
++    """注册 Telegram 回调查询事件处理器
++
++    Hook 参数:
++        event: TelegramCallbackQueryEvent
++
++    说明:
++        当用户点击内联键盘按钮时触发
++    """
++
++    def decorator(awaitable):
++        _ = get_handler_or_create(
++            awaitable, EventType.CallbackQueryEvent, **kwargs
++        )
++        return awaitable
++
++    return decorator
+diff --git a/astrbot/core/star/star_handler.py b/astrbot/core/star/star_handler.py
+index ea87e578506189380928572b8c66654d2e46fb13..bd8a703c1a7ad58c44647db06b33626f93475f8d 100644
+--- a/astrbot/core/star/star_handler.py
++++ b/astrbot/core/star/star_handler.py
+@@ -226,6 +226,9 @@ class EventType(enum.Enum):
+     OnPlatformLoadedEvent = enum.auto()  # 平台加载完成
+ 
+     AdapterMessageEvent = enum.auto()  # 收到适配器发来的消息
++    InlineQueryEvent = enum.auto()  # Telegram 内联查询事件
++    ChosenInlineResultEvent = enum.auto()  # Telegram 选择内联结果事件
++    CallbackQueryEvent = enum.auto()  # Telegram 回调查询事件（键盘按钮点击）
+     OnWaitingLLMRequestEvent = enum.auto()  # 等待调用 LLM（在获取锁之前，仅通知）
+     OnLLMRequestEvent = enum.auto()  # 收到 LLM 请求（可以是用户也可以是插件）
+     OnLLMResponseEvent = enum.auto()  # LLM 响应后

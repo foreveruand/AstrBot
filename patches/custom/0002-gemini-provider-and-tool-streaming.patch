@@ -1,0 +1,1074 @@
+diff --git a/.gitignore b/.gitignore
+index 5eb9616c8ce33704914fa88720adf1c01e3f390f..da727f9c4cdaced655d168c45925895fabadba64 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -62,5 +62,5 @@ GenieData/
+ .opencode/
+ .kilocode/
+ .worktrees/
+-
++.agents/
+ dashboard/bun.lock
+diff --git a/astrbot/api/event/filter/__init__.py b/astrbot/api/event/filter/__init__.py
+index c67a96c9c3629afc213b5c3b1fd6c0f46e3fa233..c40709cfcefa99e9db0c89812254066d4b225628 100644
+--- a/astrbot/api/event/filter/__init__.py
++++ b/astrbot/api/event/filter/__init__.py
+@@ -9,10 +9,10 @@ from astrbot.core.star.filter.platform_adapter_type import (
+     PlatformAdapterTypeFilter,
+ )
+ from astrbot.core.star.register import register_after_message_sent as after_message_sent
++from astrbot.core.star.register import register_callback_query as callback_query
+ from astrbot.core.star.register import (
+     register_chosen_inline_result as chosen_inline_result,
+ )
+-from astrbot.core.star.register import register_callback_query as callback_query
+ from astrbot.core.star.register import register_command as command
+ from astrbot.core.star.register import register_command_group as command_group
+ from astrbot.core.star.register import register_custom_filter as custom_filter
+diff --git a/astrbot/core/agent/message.py b/astrbot/core/agent/message.py
+index bde6353ff35b78f1894f979014cfe5b6d66a4a76..94e9f1f15b766610f84668522790ed0bd02e5394 100644
+--- a/astrbot/core/agent/message.py
++++ b/astrbot/core/agent/message.py
+@@ -123,6 +123,24 @@ class AudioURLPart(ContentPart):
+     audio_url: AudioURL
+ 
+ 
++class GeminiToolCallPart(ContentPart):
++    """A Gemini server-side tool call part."""
++
++    type: str = "tool_call"
++    id: str
++    tool_type: str
++    args: dict[str, Any] | None = None
++
++
++class GeminiToolResponsePart(ContentPart):
++    """A Gemini server-side tool response part."""
++
++    type: str = "tool_response"
++    id: str
++    tool_type: str
++    response: dict[str, Any] | None = None
++
++
+ class ToolCall(BaseModel):
+     """
+     A tool call requested by the assistant.
+diff --git a/astrbot/core/agent/runners/tool_loop_agent_runner.py b/astrbot/core/agent/runners/tool_loop_agent_runner.py
+index 6e3ba40a98be07b0c775fe29b210425782cde692..17ca699f7315f915518c9f388fbd12b230c6c0e5 100644
+--- a/astrbot/core/agent/runners/tool_loop_agent_runner.py
++++ b/astrbot/core/agent/runners/tool_loop_agent_runner.py
+@@ -431,6 +431,21 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
+         else:
+             yield await self.provider.text_chat(**payload)
+ 
++    @staticmethod
++    def _build_partial_stream_response(
++        streamed_completion_chunks: list[str],
++        streamed_reasoning_chunks: list[str],
++    ) -> LLMResponse | None:
++        completion_text = "".join(streamed_completion_chunks)
++        reasoning_content = "".join(streamed_reasoning_chunks)
++        if not completion_text.strip() and not reasoning_content.strip():
++            return None
++        return LLMResponse(
++            role="assistant",
++            completion_text=completion_text,
++            reasoning_content=reasoning_content,
++        )
++
+     async def _iter_llm_responses_with_fallback(
+         self,
+     ) -> T.AsyncGenerator[LLMResponse, None]:
+@@ -464,12 +479,22 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
+ 
+                 async for attempt in retrying:
+                     has_stream_output = False
++                    streamed_completion_chunks: list[str] = []
++                    streamed_reasoning_chunks: list[str] = []
+                     with attempt:
+                         try:
+                             async for resp in self._iter_llm_responses(
+                                 include_model=idx == 0
+                             ):
+                                 if resp.is_chunk:
++                                    if resp.completion_text:
++                                        streamed_completion_chunks.append(
++                                            resp.completion_text
++                                        )
++                                    if resp.reasoning_content:
++                                        streamed_reasoning_chunks.append(
++                                            resp.reasoning_content
++                                        )
+                                     has_stream_output = True
+                                     yield resp
+                                     continue
+@@ -490,13 +515,26 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
+                                 return
+ 
+                             if has_stream_output:
++                                partial_resp = self._build_partial_stream_response(
++                                    streamed_completion_chunks,
++                                    streamed_reasoning_chunks,
++                                )
++                                if partial_resp is not None:
++                                    yield partial_resp
+                                 return
+                         except EmptyModelOutputError:
+                             if has_stream_output:
+                                 logger.warning(
+-                                    "Chat Model %s returned empty output after streaming started; skipping empty-output retry.",
++                                    "Chat Model %s returned empty output after streaming started; keeping the partial streamed response and skipping retry/fallback.",
+                                     candidate_id,
+                                 )
++                                partial_resp = self._build_partial_stream_response(
++                                    streamed_completion_chunks,
++                                    streamed_reasoning_chunks,
++                                )
++                                if partial_resp is not None:
++                                    yield partial_resp
++                                    return
+                             else:
+                                 logger.warning(
+                                     "Chat Model %s returned empty output on attempt %s/%s.",
+@@ -783,16 +821,7 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
+                 return
+ 
+             # 将结果添加到上下文中
+-            parts = []
+-            if llm_resp.reasoning_content or llm_resp.reasoning_signature:
+-                parts.append(
+-                    ThinkPart(
+-                        think=llm_resp.reasoning_content,
+-                        encrypted=llm_resp.reasoning_signature,
+-                    )
+-                )
+-            if llm_resp.completion_text:
+-                parts.append(TextPart(text=llm_resp.completion_text))
++            parts = llm_resp.build_assistant_message_parts()
+             if len(parts) == 0:
+                 parts = None
+             tool_calls_result = ToolCallsResult(
+@@ -1266,16 +1295,7 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
+         self._transition_state(AgentState.DONE)
+         self.stats.end_time = time.time()
+ 
+-        parts = []
+-        if llm_resp.reasoning_content or llm_resp.reasoning_signature:
+-            parts.append(
+-                ThinkPart(
+-                    think=llm_resp.reasoning_content,
+-                    encrypted=llm_resp.reasoning_signature,
+-                )
+-            )
+-        if llm_resp.completion_text:
+-            parts.append(TextPart(text=llm_resp.completion_text))
++        parts = llm_resp.build_assistant_message_parts()
+         if parts:
+             self.run_context.messages.append(Message(role="assistant", content=parts))
+ 
+diff --git a/astrbot/core/pipeline/respond/stage.py b/astrbot/core/pipeline/respond/stage.py
+index 0636b4f2047d8c60a69f7ca81692c8eb4a7fde19..f0094fdb2241f27fc0ce9a9bd26982e2bd7d427e 100644
+--- a/astrbot/core/pipeline/respond/stage.py
++++ b/astrbot/core/pipeline/respond/stage.py
+@@ -254,7 +254,9 @@ class RespondStage(Stage):
+                         else:
+                             reply_markup = result.reply_markup if is_last else None
+                             await event.send(
+-                                MessageChain([*header_comps, comp], reply_markup=reply_markup)
++                                MessageChain(
++                                    [*header_comps, comp], reply_markup=reply_markup
++                                )
+                             )
+                             header_comps.clear()
+                     except Exception as e:
+diff --git a/astrbot/core/platform/sources/telegram/tg_adapter.py b/astrbot/core/platform/sources/telegram/tg_adapter.py
+index 1aa5584d4f1452733fb49db9ae7c92b93305da7b..c84dbc51ad21c6773ba087752c58b1af3455156d 100644
+--- a/astrbot/core/platform/sources/telegram/tg_adapter.py
++++ b/astrbot/core/platform/sources/telegram/tg_adapter.py
+@@ -807,9 +807,7 @@ class TelegramPlatformAdapter(Platform):
+             data=update.callback_query.data or "",
+             from_user_id=str(update.callback_query.from_user.id),
+             message=update.callback_query.message,
+-            inline_message_id=getattr(
+-                update.callback_query, "inline_message_id", None
+-            ),
++            inline_message_id=getattr(update.callback_query, "inline_message_id", None),
+             platform_meta=self.meta(),
+             session_id=str(update.callback_query.from_user.id),
+             client=self.client,
+diff --git a/astrbot/core/platform/sources/telegram/tg_event.py b/astrbot/core/platform/sources/telegram/tg_event.py
+index 2f831d151b11b04692c151433dc1772a8663bfd6..090bccb3cce3904ba3ed331a4e55c3b40ce9c8d2 100644
+--- a/astrbot/core/platform/sources/telegram/tg_event.py
++++ b/astrbot/core/platform/sources/telegram/tg_event.py
+@@ -1189,7 +1189,9 @@ class TelegramChosenInlineResultEvent(AstrMessageEvent):
+         try:
+             markdown_text = telegramify_markdown.markdownify(text)
+             await self._edit_inline_message(
+-                markdown_text, parse_mode="MarkdownV2", reply_markup=reply_markup_keyboard
++                markdown_text,
++                parse_mode="MarkdownV2",
++                reply_markup=reply_markup_keyboard,
+             )
+         except Exception as e:
+             logger.warning(f"Markdown转换失败，使用普通文本: {e!s}")
+@@ -1252,7 +1254,9 @@ class TelegramChosenInlineResultEvent(AstrMessageEvent):
+                     )
+                 except Exception as e:
+                     logger.warning(f"Markdown转换失败，使用普通文本: {e!s}")
+-                    await self._edit_inline_message(delta, reply_markup=reply_markup_keyboard)
++                    await self._edit_inline_message(
++                        delta, reply_markup=reply_markup_keyboard
++                    )
+         except Exception as e:
+             logger.warning(f"编辑消息失败(streaming): {e!s}")
+ 
+@@ -1411,7 +1415,9 @@ class TelegramCallbackQueryEvent(AstrMessageEvent):
+         try:
+             markdown_text = telegramify_markdown.markdownify(text)
+             await self._edit_message(
+-                markdown_text, parse_mode="MarkdownV2", reply_markup=reply_markup_keyboard
++                markdown_text,
++                parse_mode="MarkdownV2",
++                reply_markup=reply_markup_keyboard,
+             )
+         except Exception as e:
+             logger.warning(f"Markdown转换失败，使用普通文本: {e!s}")
+diff --git a/astrbot/core/platform/sources/weixin_oc/weixin_oc_adapter.py b/astrbot/core/platform/sources/weixin_oc/weixin_oc_adapter.py
+index f70cc556e325b699f8bce0393116b9a749b63d8c..c752815ec24fda556cc9b7e76a721211b1c0a6af 100644
+--- a/astrbot/core/platform/sources/weixin_oc/weixin_oc_adapter.py
++++ b/astrbot/core/platform/sources/weixin_oc/weixin_oc_adapter.py
+@@ -151,6 +151,9 @@ class WeixinOCAdapter(Platform):
+         self._context_tokens: dict[str, str] = {}
+         self._typing_states: dict[str, TypingSessionState] = {}
+         self._last_inbound_error = ""
++        self._last_activity_ts: float = time.time()
++        self._last_active_user_id: str | None = None
++        self._session_keepalive_task: asyncio.Task | None = None
+         self._recent_message_cache_size = self._get_int_config(
+             "weixin_oc_recent_message_cache_size",
+             self.RECENT_MESSAGE_CACHE_SIZE,
+@@ -175,6 +178,18 @@ class WeixinOCAdapter(Platform):
+             5,
+             int(platform_config.get("weixin_oc_typing_ticket_ttl", 60)),
+         )
++        self._session_keepalive_threshold_h = max(
++            1,
++            int(platform_config.get("weixin_oc_session_keepalive_threshold_h", 20)),
++        )
++        self._session_keepalive_check_interval_s = max(
++            60,
++            int(
++                platform_config.get(
++                    "weixin_oc_session_keepalive_check_interval_s", 1800
++                )
++            ),
++        )
+ 
+         self.token = str(platform_config.get("weixin_oc_token", "")).strip() or None
+         self.account_id = (
+@@ -561,6 +576,83 @@ class WeixinOCAdapter(Platform):
+         self._sync_client_state()
+         astrbot_config.save_config()
+ 
++    @staticmethod
++    def _is_session_expired(ret: int, errcode: int) -> bool:
++        return ret == -14 or errcode == -14
++
++    async def _handle_session_expired(self) -> None:
++        logger.error(
++            "weixin_oc(%s): session expired, clearing token for re-login",
++            self.meta().id,
++        )
++        self.token = None
++        self.client.token = None
++        self._login_session = None
++        self._last_inbound_error = "session expired, need re-login"
++        await self._cancel_task_safely(
++            self._session_keepalive_task,
++            log_message="weixin_oc(%s): keepalive task cancel error on session expiry",
++            log_args=(self.meta().id,),
++        )
++        self._session_keepalive_task = None
++        await self._save_account_state()
++
++    async def _session_keepalive_loop(self) -> None:
++        while not self._shutdown_event.is_set():
++            await asyncio.sleep(self._session_keepalive_check_interval_s)
++            if self._shutdown_event.is_set() or not self.token:
++                return
++
++            idle_seconds = time.time() - self._last_activity_ts
++            idle_hours = idle_seconds / 3600
++            if idle_hours < self._session_keepalive_threshold_h:
++                continue
++
++            user_id = self._last_active_user_id
++            if not user_id or user_id not in self._context_tokens:
++                for uid in self._context_tokens:
++                    user_id = uid
++                    break
++
++            if not user_id:
++                logger.warning(
++                    "weixin_oc(%s): session keepalive skipped, "
++                    "no user with context token available",
++                    self.meta().id,
++                )
++                continue
++
++            remaining_h = max(0, 24 - idle_hours)
++            text = (
++                f"[系统提醒] 您的 Bot 已超过 {int(idle_hours)} 小时未收到消息，"
++                f"距离会话过期还有约 {int(remaining_h)} 小时。"
++                f"请回复任意内容以保持会话活跃。"
++            )
++            try:
++                success = await self._send_items_to_session(
++                    user_id,
++                    [self._build_plain_text_item(text)],
++                )
++                if success:
++                    logger.info(
++                        "weixin_oc(%s): session keepalive sent to %s (idle %.1fh)",
++                        self.meta().id,
++                        user_id,
++                        idle_hours,
++                    )
++                else:
++                    logger.warning(
++                        "weixin_oc(%s): session keepalive send failed for %s",
++                        self.meta().id,
++                        user_id,
++                    )
++            except Exception as e:
++                logger.warning(
++                    "weixin_oc(%s): session keepalive error: %s",
++                    self.meta().id,
++                    e,
++                )
++
+     def _is_login_session_valid(
+         self, login_session: OpenClawLoginSession | None
+     ) -> bool:
+@@ -901,6 +993,7 @@ class WeixinOCAdapter(Platform):
+                 include_ref_text=False,
+             ),
+         )
++        self._last_activity_ts = time.time()
+         return True
+ 
+     def _build_cache_components_from_items(
+@@ -1443,6 +1536,9 @@ class WeixinOCAdapter(Platform):
+             logger.debug("weixin_oc: skip message with empty from_user_id.")
+             return
+ 
++        self._last_activity_ts = time.time()
++        self._last_active_user_id = from_user_id
++
+         context_token = str(msg.get("context_token", "")).strip()
+         if context_token:
+             self._context_tokens[from_user_id] = context_token
+@@ -1530,6 +1626,11 @@ class WeixinOCAdapter(Platform):
+             token_required=True,
+             timeout_ms=self.long_poll_timeout_ms,
+         )
++        ret = int(data.get("ret") or 0)
++        errcode = int(data.get("errcode", 0) or 0)
++        if self._is_session_expired(ret, errcode):
++            await self._handle_session_expired()
++            return
+         if not self._is_successful_api_payload(data):
+             self._last_inbound_error = self._format_api_error(data)
+             logger.warning(
+@@ -1667,6 +1768,15 @@ class WeixinOCAdapter(Platform):
+                         await asyncio.sleep(self.qr_poll_interval)
+                     continue
+ 
++                if (
++                    self._session_keepalive_task is None
++                    or self._session_keepalive_task.done()
++                ):
++                    self._last_activity_ts = time.time()
++                    self._session_keepalive_task = asyncio.create_task(
++                        self._session_keepalive_loop()
++                    )
++
+                 try:
+                     await self._poll_inbound_updates()
+                 except asyncio.TimeoutError:
+@@ -1686,11 +1796,23 @@ class WeixinOCAdapter(Platform):
+         except Exception as e:
+             logger.exception("weixin_oc(%s): run failed: %s", self.meta().id, e)
+         finally:
++            await self._cancel_task_safely(
++                self._session_keepalive_task,
++                log_message="weixin_oc(%s): keepalive task cleanup error",
++                log_args=(self.meta().id,),
++            )
++            self._session_keepalive_task = None
+             await self._cleanup_typing_tasks()
+             await self.client.close()
+ 
+     async def terminate(self) -> None:
+         self._shutdown_event.set()
++        await self._cancel_task_safely(
++            self._session_keepalive_task,
++            log_message="weixin_oc(%s): keepalive task terminate error",
++            log_args=(self.meta().id,),
++        )
++        self._session_keepalive_task = None
+         await self._cleanup_typing_tasks()
+ 
+     def get_stats(self) -> dict:
+@@ -1709,5 +1831,12 @@ class WeixinOCAdapter(Platform):
+             "qr_error": login_session.error if login_session else None,
+             "sync_buf_len": len(self._sync_buf),
+             "last_error": self._last_inbound_error,
++            "last_activity_ts": self._last_activity_ts,
++            "idle_hours": round((time.time() - self._last_activity_ts) / 3600, 1),
++            "keepalive_threshold_h": self._session_keepalive_threshold_h,
++            "keepalive_running": (
++                self._session_keepalive_task is not None
++                and not self._session_keepalive_task.done()
++            ),
+         }
+         return stat
+diff --git a/astrbot/core/provider/entities.py b/astrbot/core/provider/entities.py
+index b27775cdd7f2f074473a62a08577f18644966d18..72203c3cf4f7743e85f7f715e7233541a81e1522 100644
+--- a/astrbot/core/provider/entities.py
++++ b/astrbot/core/provider/entities.py
+@@ -354,6 +354,8 @@ class LLMResponse:
+     """The reasoning content extracted from the LLM, if any."""
+     reasoning_signature: str | None = None
+     """The signature of the reasoning content, if any."""
++    assistant_content_parts: list[ContentPart] = field(default_factory=list)
++    """Structured assistant content parts kept for history serialization."""
+ 
+     raw_completion: (
+         ChatCompletion | GenerateContentResponse | AnthropicMessage | None
+@@ -382,6 +384,7 @@ class LLMResponse:
+         tools_call_extra_content: dict[str, dict[str, Any]] | None = None,
+         reasoning_content: str | None = None,
+         reasoning_signature: str | None = None,
++        assistant_content_parts: list[ContentPart] | None = None,
+         raw_completion: ChatCompletion
+         | GenerateContentResponse
+         | AnthropicMessage
+@@ -411,6 +414,8 @@ class LLMResponse:
+             tools_call_ids = []
+         if tools_call_extra_content is None:
+             tools_call_extra_content = {}
++        if assistant_content_parts is None:
++            assistant_content_parts = []
+ 
+         self.role = role
+         self.completion_text = completion_text
+@@ -421,6 +426,7 @@ class LLMResponse:
+         self.tools_call_extra_content = tools_call_extra_content
+         self.reasoning_content = reasoning_content
+         self.reasoning_signature = reasoning_signature
++        self.assistant_content_parts = assistant_content_parts
+         self.raw_completion = raw_completion
+         self.is_chunk = is_chunk
+ 
+@@ -485,6 +491,27 @@ class LLMResponse:
+             )
+         return ret
+ 
++    def build_assistant_message_parts(self) -> list[ContentPart]:
++        """Build assistant content parts for history serialization."""
++        if self.assistant_content_parts:
++            return list(self.assistant_content_parts)
++
++        parts: list[ContentPart] = []
++        if self.reasoning_content or self.reasoning_signature:
++            from astrbot.core.agent.message import ThinkPart
++
++            parts.append(
++                ThinkPart(
++                    think=self.reasoning_content,
++                    encrypted=self.reasoning_signature,
++                )
++            )
++        if self.completion_text:
++            from astrbot.core.agent.message import TextPart
++
++            parts.append(TextPart(text=self.completion_text))
++        return parts
++
+ 
+ @dataclass
+ class RerankResult:
+diff --git a/astrbot/core/provider/sources/gemini_source.py b/astrbot/core/provider/sources/gemini_source.py
+index 158170d516036b14f89a06e47a62b0edc50091cc..0c6bfa597c58baa9803fe7c9ea112630654ae126 100644
+--- a/astrbot/core/provider/sources/gemini_source.py
++++ b/astrbot/core/provider/sources/gemini_source.py
+@@ -4,6 +4,7 @@ import json
+ import logging
+ import random
+ import uuid
++import time
+ from collections.abc import AsyncGenerator
+ from pathlib import Path
+ from typing import Literal, cast
+@@ -16,7 +17,16 @@ from google.genai.errors import APIError
+ import astrbot.core.message.components as Comp
+ from astrbot import logger
+ from astrbot.api.provider import Provider
+-from astrbot.core.agent.message import AudioURLPart, ContentPart, ImageURLPart, TextPart
++from astrbot.core.exceptions import EmptyModelOutputError
++from astrbot.core.agent.message import (
++    AudioURLPart,
++    ContentPart,
++    GeminiToolCallPart,
++    GeminiToolResponsePart,
++    ImageURLPart,
++    TextPart,
++    ThinkPart,
++)
+ from astrbot.core.exceptions import EmptyModelOutputError
+ from astrbot.core.message.message_event_result import MessageChain
+ from astrbot.core.provider.entities import LLMResponse, TokenUsage
+@@ -154,15 +164,22 @@ class ProviderGoogleGenAI(Provider):
+             logger.warning("流式输出不支持图片模态，已自动降级为文本模态")
+             modalities = ["TEXT"]
+ 
+-        tool_list: list[types.Tool] | None = []
+         model_name = cast(str, payloads.get("model", self.get_model()))
+         native_coderunner = self.provider_config.get("gm_native_coderunner", False)
+         native_search = self.provider_config.get("gm_native_search", False)
+         url_context = self.provider_config.get("gm_url_context", False)
++        supports_tool_combination = "gemini-3" in model_name
++        tool_config_fields = getattr(types.ToolConfig, "model_fields", {})
++        supports_server_side_tool_invocations = (
++            "include_server_side_tool_invocations" in tool_config_fields
++        )
++
++        builtin_tool_payload: dict[str, object] = {}
++        tool_config = None
+ 
+         if "gemini-2.5" in model_name:
+             if native_coderunner:
+-                tool_list.append(types.Tool(code_execution=types.ToolCodeExecution()))
++                builtin_tool_payload["code_execution"] = types.ToolCodeExecution()
+                 if native_search:
+                     logger.warning("代码执行工具与搜索工具互斥，已忽略搜索工具")
+                 if url_context:
+@@ -171,11 +188,11 @@ class ProviderGoogleGenAI(Provider):
+                     )
+             else:
+                 if native_search:
+-                    tool_list.append(types.Tool(google_search=types.GoogleSearch()))
++                    builtin_tool_payload["google_search"] = types.GoogleSearch()
+ 
+                 if url_context:
+                     if hasattr(types, "UrlContext"):
+-                        tool_list.append(types.Tool(url_context=types.UrlContext()))
++                        builtin_tool_payload["url_context"] = types.UrlContext()
+                     else:
+                         logger.warning(
+                             "当前 SDK 版本不支持 URL 上下文工具，已忽略该设置，请升级 google-genai 包",
+@@ -190,42 +207,80 @@ class ProviderGoogleGenAI(Provider):
+ 
+         else:
+             if native_coderunner:
+-                tool_list.append(types.Tool(code_execution=types.ToolCodeExecution()))
++                builtin_tool_payload["code_execution"] = types.ToolCodeExecution()
+                 if native_search:
+                     logger.warning("代码执行工具与搜索工具互斥，已忽略搜索工具")
+             elif native_search:
+-                tool_list.append(types.Tool(google_search=types.GoogleSearch()))
++                builtin_tool_payload["google_search"] = types.GoogleSearch()
+ 
+             if url_context and not native_coderunner:
+                 if hasattr(types, "UrlContext"):
+-                    tool_list.append(types.Tool(url_context=types.UrlContext()))
++                    builtin_tool_payload["url_context"] = types.UrlContext()
+                 else:
+                     logger.warning(
+                         "当前 SDK 版本不支持 URL 上下文工具，已忽略该设置，请升级 google-genai 包",
+                     )
+ 
+-        if not tool_list:
+-            tool_list = None
+-
+-        if tools and tool_list:
+-            logger.warning("已启用原生工具，函数工具将被忽略")
+-        elif tools and (func_desc := tools.get_func_desc_google_genai_style()):
++        has_builtin_tools = bool(builtin_tool_payload)
++        function_declarations = None
++        if tools and (func_desc := tools.google_schema()):
++            function_declarations = func_desc["function_declarations"]
++
++        tool_list: list[types.Tool] | None = None
++        # Track whether function_declarations were actually included in tool_list.
++        # function_calling_config must only be sent when function declarations are present.
++        function_declarations_in_tool_list = False
++        if has_builtin_tools and function_declarations:
++            if supports_tool_combination:
++                tool_list = [
++                    types.Tool(
++                        **builtin_tool_payload,
++                        function_declarations=function_declarations,
++                    )
++                ]
++                function_declarations_in_tool_list = True
++                if supports_server_side_tool_invocations:
++                    tool_config = types.ToolConfig(
++                        include_server_side_tool_invocations=True,
++                    )
++                else:
++                    logger.warning(
++                        "当前 google-genai SDK 不支持 include_server_side_tool_invocations，"
++                        "Gemini 内置工具与函数工具组合将降级为无服务端工具历史回流。",
++                    )
++            else:
++                logger.warning(
++                    "当前 Gemini 模型不支持内置工具与函数工具组合调用，函数工具将被忽略",
++                )
++                tool_list = [types.Tool(**builtin_tool_payload)]
++                # function_declarations_in_tool_list stays False — do NOT send function_calling_config
++        elif has_builtin_tools:
++            tool_list = [types.Tool(**builtin_tool_payload)]
++        elif function_declarations:
+             tool_list = [
+-                types.Tool(function_declarations=func_desc["function_declarations"]),
++                types.Tool(function_declarations=function_declarations),
+             ]
++            function_declarations_in_tool_list = True
+ 
+-        tool_config = None
+-        has_func_decl = tool_list and any(t.function_declarations for t in tool_list)
+-        if has_func_decl:
+-            tool_config = types.ToolConfig(
+-                function_calling_config=types.FunctionCallingConfig(
++        if function_declarations_in_tool_list and tool_list:
++            tool_config_kwargs: dict[str, object] = {
++                "function_calling_config": types.FunctionCallingConfig(
+                     mode=(
+                         types.FunctionCallingConfigMode.ANY
+                         if tool_choice == "required"
+                         else types.FunctionCallingConfigMode.AUTO
+                     )
++                ),
++            }
++            if (
++                supports_server_side_tool_invocations
++                and tool_config is not None
++                and tool_config.include_server_side_tool_invocations is not None
++            ):
++                tool_config_kwargs["include_server_side_tool_invocations"] = (
++                    tool_config.include_server_side_tool_invocations
+                 )
+-            )
++            tool_config = types.ToolConfig(**tool_config_kwargs)
+ 
+         # oper thinking config
+         thinking_config = None
+@@ -328,12 +383,7 @@ class ProviderGoogleGenAI(Provider):
+                 contents.append(content_cls(parts=part))
+ 
+         gemini_contents: list[types.Content] = []
+-        native_tool_enabled = any(
+-            [
+-                self.provider_config.get("gm_native_coderunner", False),
+-                self.provider_config.get("gm_native_search", False),
+-            ],
+-        )
++        tool_call_name_map: dict[str, str] = {}
+         for message in payloads["messages"]:
+             role, content = message["role"], message.get("content")
+ 
+@@ -356,42 +406,73 @@ class ProviderGoogleGenAI(Provider):
+                 append_or_extend(gemini_contents, parts, types.UserContent)
+ 
+             elif role == "assistant":
++                parts = []
+                 if isinstance(content, str):
+-                    parts = [types.Part.from_text(text=content)]
+-                    append_or_extend(gemini_contents, parts, types.ModelContent)
++                    parts.append(types.Part.from_text(text=content))
+                 elif isinstance(content, list):
+-                    parts = []
+-                    thinking_signature = None
+-                    text = ""
+                     for part in content:
+-                        # for most cases, assistant content only contains two parts: think and text
+-                        if part.get("type") == "think":
++                        part_type = part.get("type")
++                        if part_type == "text":
++                            parts.append(
++                                types.Part.from_text(text=str(part.get("text") or " "))
++                            )
++                        elif part_type == "think":
+                             thinking_signature = part.get("encrypted") or None
+-                        else:
+-                            text += str(part.get("text"))
+-
+-                    if thinking_signature and isinstance(thinking_signature, str):
+-                        try:
+-                            thinking_signature = base64.b64decode(thinking_signature)
+-                        except Exception as e:
+-                            logger.warning(
+-                                f"Failed to decode google gemini thinking signature: {e}",
+-                                exc_info=True,
++                            if thinking_signature and isinstance(
++                                thinking_signature, str
++                            ):
++                                try:
++                                    thinking_signature = base64.b64decode(
++                                        thinking_signature
++                                    )
++                                except Exception as e:
++                                    logger.warning(
++                                        f"Failed to decode google gemini thinking signature: {e}",
++                                        exc_info=True,
++                                    )
++                                    thinking_signature = None
++                            parts.append(
++                                types.Part(
++                                    text=str(part.get("think") or ""),
++                                    thought=True,
++                                    thought_signature=thinking_signature,
++                                )
++                            )
++                        elif part_type == "tool_call":
++                            tool_type = part.get("tool_type")
++                            if not tool_type:
++                                continue
++                            parts.append(
++                                types.Part(
++                                    tool_call=types.ToolCall(
++                                        id=part.get("id"),
++                                        tool_type=types.ToolType(tool_type),
++                                        args=part.get("args"),
++                                    )
++                                )
++                            )
++                        elif part_type == "tool_response":
++                            tool_type = part.get("tool_type")
++                            if not tool_type:
++                                continue
++                            parts.append(
++                                types.Part(
++                                    tool_response=types.ToolResponse(
++                                        id=part.get("id"),
++                                        tool_type=types.ToolType(tool_type),
++                                        response=part.get("response"),
++                                    )
++                                )
+                             )
+-                            thinking_signature = None
+-                    parts.append(
+-                        types.Part(
+-                            text=text,
+-                            thought_signature=thinking_signature,
+-                        )
+-                    )
+-                    append_or_extend(gemini_contents, parts, types.ModelContent)
+ 
+-                elif not native_tool_enabled and "tool_calls" in message:
+-                    parts = []
++                if message.get("tool_calls"):
+                     for tool in message["tool_calls"]:
++                        tool_name = tool["function"]["name"]
++                        tool_call_id = tool.get("id")
++                        if tool_call_id:
++                            tool_call_name_map[tool_call_id] = tool_name
+                         part = types.Part.from_function_call(
+-                            name=tool["function"]["name"],
++                            name=tool_name,
+                             args=json.loads(tool["function"]["arguments"]),
+                         )
+                         # we should set thought_signature back to part if exists
+@@ -405,26 +486,39 @@ class ProviderGoogleGenAI(Provider):
+                             )
+                             if ts_bs64:
+                                 part.thought_signature = base64.b64decode(ts_bs64)
++                        if part.function_call and tool_call_id:
++                            part.function_call.id = tool_call_id
+                         parts.append(part)
++
++                if parts:
+                     append_or_extend(gemini_contents, parts, types.ModelContent)
+                 else:
+                     logger.warning("assistant 角色的消息内容为空，已添加空格占位")
+-                    if native_tool_enabled and "tool_calls" in message:
+-                        logger.warning(
+-                            "检测到启用Gemini原生工具，且上下文中存在函数调用，建议使用 /reset 重置上下文",
+-                        )
+                     parts = [types.Part.from_text(text=" ")]
+                     append_or_extend(gemini_contents, parts, types.ModelContent)
+ 
+-            elif role == "tool" and not native_tool_enabled:
+-                func_name = message.get("name", message["tool_call_id"])
++            elif role == "tool":
++                tool_call_id = message["tool_call_id"]
++                func_name = message.get("name") or tool_call_name_map.get(tool_call_id)
++                if not func_name:
++                    logger.warning(
++                        "Gemini tool response missing function name for tool_call_id=%s; "
++                        "falling back to tool_call_id",
++                        tool_call_id,
++                    )
++                    func_name = tool_call_id
++                response_payload: dict[str, object]
++                try:
++                    parsed_content = json.loads(message["content"])
++                except (TypeError, json.JSONDecodeError):
++                    parsed_content = message["content"]
++                response_payload = {"result": parsed_content}
+                 part = types.Part.from_function_response(
+                     name=func_name,
+-                    response={
+-                        "name": func_name,
+-                        "content": message["content"],
+-                    },
++                    response=response_payload,
+                 )
++                if part.function_response:
++                    part.function_response.id = tool_call_id
+ 
+                 parts = [part]
+                 append_or_extend(gemini_contents, parts, types.UserContent)
+@@ -523,6 +617,7 @@ class ProviderGoogleGenAI(Provider):
+             llm_response.reasoning_content = reasoning
+ 
+         chain = []
++        assistant_content_parts: list[ContentPart] = []
+         part: types.Part
+ 
+         # 暂时这样Fallback
+@@ -540,6 +635,18 @@ class ProviderGoogleGenAI(Provider):
+             # which also causes duplicate/triple replies on some platforms.
+             if part.text and not part.thought:
+                 chain.append(Comp.Plain(part.text))
++                assistant_content_parts.append(TextPart(text=part.text))
++            elif part.text and part.thought:
++                assistant_content_parts.append(
++                    ThinkPart(
++                        think=part.text,
++                        encrypted=(
++                            base64.b64encode(part.thought_signature).decode("utf-8")
++                            if part.thought_signature
++                            else None
++                        ),
++                    )
++                )
+ 
+             if (
+                 part.function_call
+@@ -567,10 +674,32 @@ class ProviderGoogleGenAI(Provider):
+             ):
+                 chain.append(Comp.Image.fromBytes(part.inline_data.data))
+ 
++            tool_call = getattr(part, "tool_call", None)
++            if tool_call and tool_call.tool_type:
++                assistant_content_parts.append(
++                    GeminiToolCallPart(
++                        id=tool_call.id or "",
++                        tool_type=tool_call.tool_type.value,
++                        args=tool_call.args,
++                    )
++                )
++
++            tool_response = getattr(part, "tool_response", None)
++            if tool_response and tool_response.tool_type:
++                assistant_content_parts.append(
++                    GeminiToolResponsePart(
++                        id=tool_response.id or "",
++                        tool_type=tool_response.tool_type.value,
++                        response=tool_response.response,
++                    )
++                )
++
+             if ts := part.thought_signature:
+                 # only keep the last thinking signature
+                 llm_response.reasoning_signature = base64.b64encode(ts).decode("utf-8")
+         chain_result = MessageChain(chain=chain)
++        llm_response.assistant_content_parts = assistant_content_parts
++        chain_result = MessageChain(chain=chain)
+         llm_response.result_chain = chain_result
+         if validate_output:
+             self._ensure_usable_response(
+@@ -755,18 +884,29 @@ class ProviderGoogleGenAI(Provider):
+                 yield llm_response
+ 
+             if chunk.candidates[0].finish_reason:
+-                # Process the final chunk for potential tool calls or other content
++                # Process the final chunk for potential tool calls or other content.
++                # A chunk that contains function_call parts is caught by the early
++                # return above, so _process_content_parts here will never see tool
++                # calls.  It can still raise EmptyModelOutputError when the parts
++                # carry no usable content (e.g. only thinking / empty parts).  In
++                # that case we fall through so the post-loop code can assemble the
++                # final response from the already-accumulated text / reasoning.
+                 if chunk.candidates[0].content.parts:
+-                    final_response = LLMResponse("assistant", is_chunk=False)
+-                    final_response.raw_completion = chunk
+-                    final_response.result_chain = self._process_content_parts(
+-                        chunk.candidates[0],
+-                        final_response,
+-                        validate_output=False,
+-                    )
+-                    final_response.id = chunk.response_id
+-                    if chunk.usage_metadata:
+-                        final_response.usage = self._extract_usage(chunk.usage_metadata)
++                    _fr = LLMResponse("assistant", is_chunk=False)
++                    _fr.raw_completion = chunk
++                    try:
++                        _fr.result_chain = self._process_content_parts(
++                            chunk.candidates[0],
++                            _fr,
++                        )
++                        _fr.id = chunk.response_id
++                        if chunk.usage_metadata:
++                            _fr.usage = self._extract_usage(chunk.usage_metadata)
++                        final_response = _fr
++                    except EmptyModelOutputError:
++                        # No usable content in the final chunk; accumulated_text
++                        # (collected from earlier delta chunks) will be used below.
++                        pass
+                 break
+ 
+         # Yield final complete response with accumulated text
+diff --git a/astrbot/core/star/register/star_handler.py b/astrbot/core/star/register/star_handler.py
+index ae0307a672e378a48305c80bd0a866575ded5a9e..3debd642cd0f5dda338eb6e8a181c60836e15f10 100644
+--- a/astrbot/core/star/register/star_handler.py
++++ b/astrbot/core/star/register/star_handler.py
+@@ -786,9 +786,7 @@ def register_callback_query(**kwargs):
+     """
+ 
+     def decorator(awaitable):
+-        _ = get_handler_or_create(
+-            awaitable, EventType.CallbackQueryEvent, **kwargs
+-        )
++        _ = get_handler_or_create(awaitable, EventType.CallbackQueryEvent, **kwargs)
+         return awaitable
+ 
+     return decorator
+diff --git a/astrbot/core/tools/computer_tools/shell.py b/astrbot/core/tools/computer_tools/shell.py
+index af933e83b15364089fe3871009f3f30045ebd253..73303382d5e1778aefee150357c07d5a1c2cf1af 100644
+--- a/astrbot/core/tools/computer_tools/shell.py
++++ b/astrbot/core/tools/computer_tools/shell.py
+@@ -39,6 +39,11 @@ class ExecuteShellTool(FunctionTool):
+                     "additionalProperties": {"type": "string"},
+                     "default": {},
+                 },
++                "timeout": {
++                    "type": "integer",
++                    "description": "Timeout in seconds for the command execution. Default is 30 seconds.",
++                    "default": 30,
++                },
+             },
+             "required": ["command"],
+         }
+@@ -50,6 +55,7 @@ class ExecuteShellTool(FunctionTool):
+         command: str,
+         background: bool = False,
+         env: dict = {},
++        timeout: int = 30,
+     ) -> ToolExecResult:
+         if permission_error := check_admin_permission(context, "Shell execution"):
+             return permission_error
+@@ -72,6 +78,7 @@ class ExecuteShellTool(FunctionTool):
+                 cwd=cwd,
+                 background=background,
+                 env=env,
++                timeout=timeout,
+             )
+             return json.dumps(result, ensure_ascii=False)
+         except Exception as e:
+diff --git a/pyproject.toml b/pyproject.toml
+index da69c3311635032f8279150c7c3db5969db6038e..00b5c56ac07cdba7d5560da93bb65aca2ee09d6c 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -70,6 +70,7 @@ dependencies = [
+ [dependency-groups]
+ dev = [
+   "commitizen>=4.9.1",
++  "croniter>=6.2.2",
+   "pytest>=8.4.1",
+   "pytest-asyncio>=1.1.0",
+   "pytest-cov>=6.2.1",
+diff --git a/tests/test_tool_loop_agent_runner.py b/tests/test_tool_loop_agent_runner.py
+index 00caed67dd5c78ee06bcbc5a3306eee92db0aaa9..90651a23d9018ce39910ca5e4069c66b8efd02e1 100644
+--- a/tests/test_tool_loop_agent_runner.py
++++ b/tests/test_tool_loop_agent_runner.py
+@@ -194,6 +194,22 @@ class MockAbortableStreamProvider(MockProvider):
+         )
+ 
+ 
++class MockStreamingEmptyAfterChunkProvider(MockProvider):
++    async def text_chat_stream(self, **kwargs):
++        self.call_count += 1
++        yield LLMResponse(
++            role="assistant",
++            completion_text="第一段",
++            is_chunk=True,
++        )
++        yield LLMResponse(
++            role="assistant",
++            completion_text="第二段",
++            is_chunk=True,
++        )
++        raise EmptyModelOutputError("stream finished without final response")
++
++
+ class MockToolCallProvider(MockProvider):
+     def __init__(self, tool_name: str, tool_args: dict[str, str] | None = None):
+         super().__init__()
+@@ -875,6 +891,38 @@ async def test_empty_output_retries_exhausted_then_uses_fallback_provider(
+     assert fallback_provider.call_count == 1
+ 
+ 
++@pytest.mark.asyncio
++async def test_streaming_empty_output_after_chunks_keeps_partial_response_without_fallback(
++    runner, provider_request, mock_tool_executor, mock_hooks, monkeypatch
++):
++    monkeypatch.setattr(runner, "EMPTY_OUTPUT_RETRY_WAIT_MIN_S", 0)
++    monkeypatch.setattr(runner, "EMPTY_OUTPUT_RETRY_WAIT_MAX_S", 0)
++
++    primary_provider = MockStreamingEmptyAfterChunkProvider()
++    fallback_provider = MockProvider()
++    fallback_provider.should_call_tools = False
++
++    await runner.reset(
++        provider=primary_provider,
++        request=provider_request,
++        run_context=ContextWrapper(context=None),
++        tool_executor=mock_tool_executor,
++        agent_hooks=mock_hooks,
++        streaming=True,
++        fallback_providers=[fallback_provider],
++    )
++
++    async for _ in runner.step_until_done(5):
++        pass
++
++    final_resp = runner.get_final_llm_resp()
++    assert final_resp is not None
++    assert final_resp.role == "assistant"
++    assert final_resp.completion_text == "第一段第二段"
++    assert primary_provider.call_count == 1
++    assert fallback_provider.call_count == 0
++
++
+ @pytest.mark.asyncio
+ async def test_stop_signal_returns_aborted_and_persists_partial_message(
+     runner, provider_request, mock_tool_executor, mock_hooks
+@@ -1174,6 +1222,13 @@ async def test_follow_up_accepted_when_active_and_not_stopping(
+         agent_hooks=mock_hooks,
+         streaming=False,
+     )
++    ticket = runner.follow_up(message_text="valid follow-up message")
++    assert ticket is not None, (
++        "Follow-up should be accepted when runner is active and not stopping"
++    )
++    assert ticket.text == "valid follow-up message"
++    assert ticket.consumed is False
++    assert ticket in runner._pending_follow_ups
+ 
+ 
+ @pytest.mark.asyncio

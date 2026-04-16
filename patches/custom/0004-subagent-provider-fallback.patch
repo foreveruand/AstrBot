@@ -1,0 +1,2206 @@
+diff --git a/astrbot/core/astr_agent_tool_exec.py b/astrbot/core/astr_agent_tool_exec.py
+index d668dfeec98086aa59398cd458de90b52df89569..cf5627548e8faad6bbab108ae46709c06c4e2feb 100644
+--- a/astrbot/core/astr_agent_tool_exec.py
++++ b/astrbot/core/astr_agent_tool_exec.py
+@@ -29,6 +29,8 @@ from astrbot.core.message.message_event_result import (
+ )
+ from astrbot.core.platform.message_session import MessageSession
+ from astrbot.core.provider.entites import ProviderRequest
++from astrbot.core.provider.fallback import get_fallback_chat_providers
++from astrbot.core.provider.provider import Provider
+ from astrbot.core.provider.register import llm_tools
+ from astrbot.core.tools.computer_tools import (
+     ExecuteShellTool,
+@@ -49,6 +51,29 @@ from astrbot.core.utils.string_utils import normalize_and_dedupe_strings
+ 
+ 
+ class FunctionToolExecutor(BaseFunctionToolExecutor[AstrAgentContext]):
++    @classmethod
++    def _is_handoff_tool_reference(
++        cls,
++        run_context: ContextWrapper[AstrAgentContext],
++        tool_name_or_obj: str | FunctionTool,
++    ) -> bool:
++        if isinstance(tool_name_or_obj, HandoffTool):
++            return True
++        if not isinstance(tool_name_or_obj, str):
++            return False
++        if tool_name_or_obj.startswith("transfer_to_"):
++            return True
++
++        orchestrator = getattr(
++            getattr(run_context.context, "context", None),
++            "subagent_orchestrator",
++            None,
++        )
++        if orchestrator is None:
++            return False
++        is_handoff_tool_name = getattr(orchestrator, "is_handoff_tool_name", None)
++        return bool(is_handoff_tool_name and is_handoff_tool_name(tool_name_or_obj))
++
+     @classmethod
+     def _collect_image_urls_from_args(cls, image_urls_raw: T.Any) -> list[str]:
+         if image_urls_raw is None:
+@@ -262,9 +287,15 @@ class FunctionToolExecutor(BaseFunctionToolExecutor[AstrAgentContext]):
+ 
+         toolset = ToolSet()
+         for tool_name_or_obj in tools:
++            if cls._is_handoff_tool_reference(run_context, tool_name_or_obj):
++                continue
+             if isinstance(tool_name_or_obj, str):
+                 registered_tool = llm_tools.get_func(tool_name_or_obj)
+-                if registered_tool and registered_tool.active:
++                if (
++                    registered_tool
++                    and not isinstance(registered_tool, HandoffTool)
++                    and registered_tool.active
++                ):
+                     toolset.add_tool(registered_tool)
+                     continue
+                 runtime_tool = runtime_computer_tools.get(tool_name_or_obj)
+@@ -311,9 +342,23 @@ class FunctionToolExecutor(BaseFunctionToolExecutor[AstrAgentContext]):
+ 
+         # Use per-subagent provider override if configured; otherwise fall back
+         # to the current/default provider resolution.
+-        prov_id = getattr(
+-            tool, "provider_id", None
+-        ) or await ctx.get_current_chat_provider_id(umo)
++        specified_provider_id = getattr(tool, "provider_id", None)
++        prov_id = specified_provider_id
++        if not prov_id:
++            selected_provider_id = event.get_extra("selected_provider")
++            if isinstance(selected_provider_id, str):
++                selected_provider_id = selected_provider_id.strip() or None
++            else:
++                selected_provider_id = None
++            prov_id = selected_provider_id or await ctx.get_current_chat_provider_id(
++                umo
++            )
++
++        prov = ctx.get_provider_by_id(prov_id)
++        if not isinstance(prov, Provider):
++            raise ValueError(
++                f"Cannot resolve chat provider `{prov_id}` for handoff execution."
++            )
+ 
+         # prepare begin dialogs
+         contexts = None
+@@ -333,6 +378,11 @@ class FunctionToolExecutor(BaseFunctionToolExecutor[AstrAgentContext]):
+         prov_settings: dict = ctx.get_config(umo=umo).get("provider_settings", {})
+         agent_max_step = int(prov_settings.get("max_agent_step", 30))
+         stream = prov_settings.get("streaming_response", False)
++        fallback_providers = (
++            []
++            if specified_provider_id
++            else get_fallback_chat_providers(prov, ctx, prov_settings)
++        )
+         llm_resp = await ctx.tool_loop_agent(
+             event=event,
+             chat_provider_id=prov_id,
+@@ -344,6 +394,7 @@ class FunctionToolExecutor(BaseFunctionToolExecutor[AstrAgentContext]):
+             max_steps=agent_max_step,
+             tool_call_timeout=run_context.tool_call_timeout,
+             stream=stream,
++            fallback_providers=fallback_providers,
+         )
+         yield mcp.types.CallToolResult(
+             content=[mcp.types.TextContent(type="text", text=llm_resp.completion_text)]
+diff --git a/astrbot/core/astr_main_agent.py b/astrbot/core/astr_main_agent.py
+index 0b74d63c6d6bd4b562f71145f6fc259a23cce49c..1045a550833b3bbb2e97d7bc4fa05eff5b7c3a6b 100644
+--- a/astrbot/core/astr_main_agent.py
++++ b/astrbot/core/astr_main_agent.py
+@@ -37,6 +37,7 @@ from astrbot.core.persona_error_reply import (
+ from astrbot.core.platform.astr_message_event import AstrMessageEvent
+ from astrbot.core.provider import Provider
+ from astrbot.core.provider.entities import ProviderRequest
++from astrbot.core.provider.fallback import get_fallback_chat_providers
+ from astrbot.core.provider.register import llm_tools
+ from astrbot.core.skills.skill_manager import SkillManager, build_skills_prompt
+ from astrbot.core.star.context import Context
+@@ -424,18 +425,28 @@ async def _ensure_persona_and_skills(
+                     "If you need to use these capabilities, ask the user to enable Computer Use in the AstrBot WebUI -> Config."
+                 )
+     tmgr = plugin_context.get_llm_tool_manager()
++    orch_cfg = plugin_context.get_config().get("subagent_orchestrator", {})
++    so = plugin_context.subagent_orchestrator
++    subagent_handoff_enabled = bool(orch_cfg.get("main_enable", False) and so)
+ 
+     # inject toolset in the persona
+-    if (persona and persona.get("tools") is None) or not persona:
++    persona_tools_config = persona.get("tools", []) if persona is not None else None
++    if persona_tools_config is None or persona is None:
+         persona_toolset = tmgr.get_full_tool_set()
+         for tool in list(persona_toolset):
+             if not tool.active:
+                 persona_toolset.remove_tool(tool.name)
++        if persona is not None and subagent_handoff_enabled:
++            for tool in so.handoffs:
++                if tool.active:
++                    persona_toolset.add_tool(tool)
+     else:
+         persona_toolset = ToolSet()
+-        if persona["tools"]:
+-            for tool_name in persona["tools"]:
++        if persona_tools_config:
++            for tool_name in persona_tools_config:
+                 tool = tmgr.get_func(tool_name)
++                if tool is None and subagent_handoff_enabled:
++                    tool = so.get_handoff(tool_name)
+                 if tool and tool.active:
+                     persona_toolset.add_tool(tool)
+     if not req.func_tool:
+@@ -444,25 +455,33 @@ async def _ensure_persona_and_skills(
+         req.func_tool.merge(persona_toolset)
+ 
+     # sub agents integration
+-    orch_cfg = plugin_context.get_config().get("subagent_orchestrator", {})
+-    so = plugin_context.subagent_orchestrator
+-    if orch_cfg.get("main_enable", False) and so:
++    selected_handoffs = [
++        tool
++        for tool in (req.func_tool.tools if req.func_tool else [])
++        if isinstance(tool, HandoffTool)
++    ]
++    if subagent_handoff_enabled and selected_handoffs:
+         remove_dup = bool(orch_cfg.get("remove_main_duplicate_tools", False))
+ 
+         assigned_tools: set[str] = set()
++        selected_handoff_agent_names = {tool.agent.name for tool in selected_handoffs}
+         agents = orch_cfg.get("agents", [])
+-        if isinstance(agents, list):
++        if remove_dup and isinstance(agents, list):
+             for a in agents:
+                 if not isinstance(a, dict):
+                     continue
+                 if a.get("enabled", True) is False:
+                     continue
++                if str(a.get("name", "")).strip() not in selected_handoff_agent_names:
++                    continue
+                 persona_tools = None
+                 pid = a.get("persona_id")
+                 if pid:
+-                    persona = plugin_context.persona_manager.get_persona_v3_by_id(pid)
+-                    if persona is not None:
+-                        persona_tools = persona.get("tools")
++                    agent_persona = plugin_context.persona_manager.get_persona_v3_by_id(
++                        pid
++                    )
++                    if agent_persona is not None:
++                        persona_tools = agent_persona.get("tools")
+                 tools = a.get("tools", [])
+                 if persona_tools is not None:
+                     tools = persona_tools
+@@ -485,13 +504,9 @@ async def _ensure_persona_and_skills(
+         if req.func_tool is None:
+             req.func_tool = ToolSet()
+ 
+-        # add subagent handoff tools
+-        for tool in so.handoffs:
+-            req.func_tool.add_tool(tool)
+-
+         # check duplicates
+         if remove_dup:
+-            handoff_names = {tool.name for tool in so.handoffs}
++            handoff_names = {tool.name for tool in selected_handoffs}
+             for tool_name in assigned_tools:
+                 if tool_name in handoff_names:
+                     continue
+@@ -1177,41 +1192,6 @@ def _get_compress_provider(
+     return provider
+ 
+ 
+-def _get_fallback_chat_providers(
+-    provider: Provider, plugin_context: Context, provider_settings: dict
+-) -> list[Provider]:
+-    fallback_ids = provider_settings.get("fallback_chat_models", [])
+-    if not isinstance(fallback_ids, list):
+-        logger.warning(
+-            "fallback_chat_models setting is not a list, skip fallback providers."
+-        )
+-        return []
+-
+-    provider_id = str(provider.provider_config.get("id", ""))
+-    seen_provider_ids: set[str] = {provider_id} if provider_id else set()
+-    fallbacks: list[Provider] = []
+-
+-    for fallback_id in fallback_ids:
+-        if not isinstance(fallback_id, str) or not fallback_id:
+-            continue
+-        if fallback_id in seen_provider_ids:
+-            continue
+-        fallback_provider = plugin_context.get_provider_by_id(fallback_id)
+-        if fallback_provider is None:
+-            logger.warning("Fallback chat provider `%s` not found, skip.", fallback_id)
+-            continue
+-        if not isinstance(fallback_provider, Provider):
+-            logger.warning(
+-                "Fallback chat provider `%s` is invalid type: %s, skip.",
+-                fallback_id,
+-                type(fallback_provider),
+-            )
+-            continue
+-        fallbacks.append(fallback_provider)
+-        seen_provider_ids.add(fallback_id)
+-    return fallbacks
+-
+-
+ async def build_main_agent(
+     *,
+     event: AstrMessageEvent,
+@@ -1471,7 +1451,7 @@ async def build_main_agent(
+         truncate_turns=config.dequeue_context_length,
+         enforce_max_turns=config.max_context_length,
+         tool_schema_mode=config.tool_schema_mode,
+-        fallback_providers=_get_fallback_chat_providers(
++        fallback_providers=get_fallback_chat_providers(
+             provider, plugin_context, config.provider_settings
+         ),
+         tool_result_overflow_dir=(
+diff --git a/astrbot/core/config/default.py b/astrbot/core/config/default.py
+index 0237b176d11b3bfb87643c91e21562cdd731c0da..4ec2dd62dcccaa190d68d08ed27f5bd1a2e12d6b 100644
+--- a/astrbot/core/config/default.py
++++ b/astrbot/core/config/default.py
+@@ -183,9 +183,9 @@ DEFAULT_CONFIG = {
+     },
+     # SubAgent orchestrator mode:
+     # - main_enable = False: disabled; main LLM mounts tools normally (persona selection).
+-    # - main_enable = True: enabled; main LLM keeps its own tools and includes handoff
+-    #   tools (transfer_to_*). remove_main_duplicate_tools can remove tools that are
+-    #   duplicated on subagents from the main LLM toolset.
++    # - main_enable = True: enabled; main LLM can use handoff tools (transfer_to_*)
++    #   selected by the active persona. remove_main_duplicate_tools can remove tools
++    #   that are duplicated on the selected subagents from the main LLM toolset.
+     "subagent_orchestrator": {
+         "main_enable": False,
+         "remove_main_duplicate_tools": False,
+diff --git a/astrbot/core/event_bus.py b/astrbot/core/event_bus.py
+index fa349530fb1023ab566846a0de156d0dbcf9a388..ce0d9a210cb5644a349544042055eb37c0a7416a 100644
+--- a/astrbot/core/event_bus.py
++++ b/astrbot/core/event_bus.py
+@@ -15,17 +15,20 @@ from asyncio import Queue
+ 
+ from astrbot.core import logger
+ from astrbot.core.astrbot_config_mgr import AstrBotConfigManager
+-from astrbot.core.message.message_event_result import (
+-    CommandResult,
+-    MessageChain,
+-    MessageEventResult,
+-    ResultContentType,
+-)
+-from astrbot.core.pipeline.context_utils import call_handler
+ from astrbot.core.pipeline.scheduler import PipelineScheduler
++from astrbot.core.platform.sources.telegram.inline_registry import (
++    telegram_inline_result_registry,
++)
++from astrbot.core.star.filter.command import CommandFilter
++from astrbot.core.star.filter.command_group import CommandGroupFilter
++from astrbot.core.star.filter.permission import PermissionTypeFilter
+ from astrbot.core.star.session_plugin_manager import SessionPluginManager
+ from astrbot.core.star.star import star_map
+-from astrbot.core.star.star_handler import EventType, star_handlers_registry
++from astrbot.core.star.star_handler import (
++    EventType,
++    StarHandlerMetadata,
++    star_handlers_registry,
++)
+ 
+ from .platform import AstrMessageEvent
+ 
+@@ -75,6 +78,15 @@ class EventBus:
+         else:
+             event.plugins_name = enabled_plugins_name
+ 
++        command_query = self._normalize_inline_command_query(query, conf)
++        if command_query is not None:
++            await self._answer_inline_command_options(
++                event,
++                command_query,
++                conf,
++            )
++            return True
++
+         handlers = star_handlers_registry.get_handlers_by_event_type(
+             EventType.InlineQueryEvent,
+             plugins_name=event.plugins_name,
+@@ -83,48 +95,185 @@ class EventBus:
+             event,
+             handlers,
+         )
+-        handled = False
+ 
++        handlers_by_module = {}
+         for handler in handlers:
+-            md = star_map.get(handler.handler_module_path)
++            handlers_by_module.setdefault(handler.handler_module_path, []).append(
++                handler
++            )
++
++        inline_query_id = str(getattr(event, "inline_query_id", ""))
++        llm_result_id = telegram_inline_result_registry.register(
++            inline_query_id=inline_query_id,
++            kind="llm",
++            query=query,
++            ordinal=0,
++        )
++        options = [
++            {
++                "id": llm_result_id,
++                "title": "LLM",
++                "description": "Ask AstrBot's configured language model.",
++                "kind": "llm",
++            }
++        ]
++
++        for ordinal, (module_path, module_handlers) in enumerate(
++            handlers_by_module.items(), start=1
++        ):
++            md = star_map.get(module_path)
+             if not md:
+                 continue
+-            try:
+-                wrapper = call_handler(event, handler.handler)
+-                async for _ in wrapper:
+-                    if await self._dispatch_inline_result(event):
+-                        handled = True
+-                        break
+-                event.clear_result()
+-            except Exception as e:
+-                logger.error(
+-                    f"InlineQuery handler error: {md.name} - {handler.handler_name}: {e}",
+-                    exc_info=True,
+-                )
+-
+-            if event.is_stopped():
+-                break
++            plugin_name = md.display_name or md.name or module_path.rsplit(".", 1)[-1]
++            description = md.desc or "Run this plugin for the inline query."
++            result_id = telegram_inline_result_registry.register(
++                inline_query_id=inline_query_id,
++                kind="plugin",
++                query=query,
++                ordinal=ordinal,
++                handlers=module_handlers,
++                plugin_module_path=module_path,
++                plugin_name=plugin_name,
++            )
++            options.append(
++                {
++                    "id": result_id,
++                    "title": str(plugin_name),
++                    "description": str(description),
++                    "kind": "plugin",
++                }
++            )
+ 
+-        if not handled and query:
+-            await event.send(MessageChain().message(query))
+-            handled = True
++        if hasattr(event, "answer_inline_options"):
++            await event.answer_inline_options(options)
++        else:
++            logger.warning("Inline query event does not support targeted options.")
+ 
+         return True
+ 
+-    async def _dispatch_inline_result(self, event: AstrMessageEvent) -> bool:
+-        result = event.get_result()
+-        if result is None:
++    def _normalize_inline_command_query(
++        self,
++        query: str,
++        conf: dict,
++    ) -> str | None:
++        message = query.strip()
++        if not message:
++            return None
++        for wake_prefix in conf.get("wake_prefix", []):
++            wake_prefix = str(wake_prefix)
++            if wake_prefix and message.startswith(wake_prefix):
++                return message[len(wake_prefix) :].strip()
++        return None
++
++    async def _answer_inline_command_options(
++        self,
++        event: AstrMessageEvent,
++        command_query: str,
++        conf: dict,
++    ) -> None:
++        handlers = star_handlers_registry.get_handlers_by_event_type(
++            EventType.AdapterMessageEvent,
++            plugins_name=event.plugins_name,
++        )
++        handlers = await SessionPluginManager.filter_handlers_by_session(
++            event,
++            handlers,
++        )
++
++        handlers_by_module: dict[str, list[StarHandlerMetadata]] = {}
++        for handler in handlers:
++            if self._is_command_group_handler(handler):
++                continue
++            if not self._match_inline_command_handler(
++                event,
++                handler,
++                command_query,
++                conf,
++            ):
++                continue
++            handlers_by_module.setdefault(handler.handler_module_path, []).append(
++                handler
++            )
++
++        options = []
++        inline_query_id = str(getattr(event, "inline_query_id", ""))
++        for ordinal, (module_path, module_handlers) in enumerate(
++            handlers_by_module.items(), start=1
++        ):
++            md = star_map.get(module_path)
++            if not md:
++                continue
++            plugin_name = md.display_name or md.name or module_path.rsplit(".", 1)[-1]
++            description = md.desc or "Run this command plugin for the inline query."
++            result_id = telegram_inline_result_registry.register(
++                inline_query_id=inline_query_id,
++                kind="plugin",
++                query=str(getattr(event, "query", "") or "").strip(),
++                ordinal=ordinal,
++                handlers=module_handlers,
++                plugin_module_path=module_path,
++                plugin_name=plugin_name,
++                use_command_flow=True,
++            )
++            options.append(
++                {
++                    "id": result_id,
++                    "title": str(plugin_name),
++                    "description": str(description),
++                    "kind": "plugin",
++                }
++            )
++
++        if hasattr(event, "answer_inline_options"):
++            await event.answer_inline_options(options)
++        else:
++            logger.warning("Inline query event does not support targeted options.")
++
++    def _is_command_group_handler(self, handler: StarHandlerMetadata) -> bool:
++        return any(
++            isinstance(filter_, CommandGroupFilter) for filter_ in handler.event_filters
++        )
++
++    def _match_inline_command_handler(
++        self,
++        event: AstrMessageEvent,
++        handler: StarHandlerMetadata,
++        command_query: str,
++        conf: dict,
++    ) -> bool:
++        if not any(
++            isinstance(filter_, CommandFilter) for filter_ in handler.event_filters
++        ):
+             return False
+-        if isinstance(result, MessageEventResult | CommandResult):
+-            if result.result_content_type == ResultContentType.STREAMING_RESULT:
+-                if result.async_stream is None:
+-                    logger.warning("async_stream 为空，跳过发送。")
+-                    return True
+-                await event.send_streaming(result.async_stream)
+-                return True
+-            await event.send(result)
++
++        original_message = event.message_str
++        original_is_wake = event.is_wake
++        original_is_at_or_wake = event.is_at_or_wake_command
++        parsed_before = event.get_extra("parsed_params", None)
++        had_parsed_before = "parsed_params" in event.get_extra(default={})
++
++        event.message_str = command_query
++        event.is_wake = True
++        event.is_at_or_wake_command = True
++        event._extras.pop("parsed_params", None)
++        try:
++            for filter_ in handler.event_filters:
++                if isinstance(filter_, PermissionTypeFilter):
++                    if not filter_.filter(event, conf):
++                        return False
++                    continue
++                if not filter_.filter(event, conf):
++                    return False
+             return True
+-        return False
++        except Exception:
++            return False
++        finally:
++            event.message_str = original_message
++            event.is_wake = original_is_wake
++            event.is_at_or_wake_command = original_is_at_or_wake
++            event._extras.pop("parsed_params", None)
++            if had_parsed_before:
++                event.set_extra("parsed_params", parsed_before)
+ 
+     def _print_event(self, event: AstrMessageEvent, conf_name: str) -> None:
+         """用于记录事件信息
+diff --git a/astrbot/core/pipeline/waking_check/stage.py b/astrbot/core/pipeline/waking_check/stage.py
+index ee78da780dcaf461efa459ce274245091f67da98..bfe3dd53e6d674327561d967f16fa76edb3fd3dc 100644
+--- a/astrbot/core/pipeline/waking_check/stage.py
++++ b/astrbot/core/pipeline/waking_check/stage.py
+@@ -5,6 +5,9 @@ from astrbot.core.message.components import At, AtAll, Reply
+ from astrbot.core.message.message_event_result import MessageChain, MessageEventResult
+ from astrbot.core.platform.astr_message_event import AstrMessageEvent
+ from astrbot.core.platform.message_type import MessageType
++from astrbot.core.platform.sources.telegram.inline_registry import (
++    telegram_inline_result_registry,
++)
+ from astrbot.core.star.filter.command import CommandFilter
+ from astrbot.core.star.filter.command_group import CommandGroupFilter
+ from astrbot.core.star.filter.permission import PermissionTypeFilter
+@@ -156,10 +159,41 @@ class WakingCheckStage(Stage):
+         )
+         chosen_inline_command_mode = False
+         if is_chosen_inline_result:
+-            self._set_enabled_plugins(event)
+-            event.is_wake = True
+-            event.is_at_or_wake_command = True
+-            chosen_inline_command_mode = self._normalize_command_prefix(event)
++            target = telegram_inline_result_registry.resolve(str(event.result_id))
++            if target is not None:
++                self._set_enabled_plugins(event)
++                event.is_wake = True
++                event.is_at_or_wake_command = True
++                if target.query:
++                    event.query = target.query
++                    event.message_str = target.query
++
++                if target.use_command_flow:
++                    chosen_inline_command_mode = self._normalize_command_prefix(event)
++                elif target.kind == "plugin":
++                    activated_handlers = target.handlers or []
++                    activated_handlers = (
++                        await SessionPluginManager.filter_handlers_by_session(
++                            event,
++                            activated_handlers,
++                        )
++                    )
++                    event.call_llm = True
++                    event.set_extra("activated_handlers", activated_handlers)
++                    event.set_extra("handlers_parsed_params", {})
++                    return
++
++                else:
++                    event.call_llm = False
++                    event.set_extra("activated_handlers", [])
++                    event.set_extra("handlers_parsed_params", {})
++                    return
++
++            else:
++                self._set_enabled_plugins(event)
++                event.is_wake = True
++                event.is_at_or_wake_command = True
++                chosen_inline_command_mode = self._normalize_command_prefix(event)
+ 
+         # 检查 wake
+         wake_prefixes = self.ctx.astrbot_config["wake_prefix"]
+diff --git a/astrbot/core/platform/sources/telegram/inline_registry.py b/astrbot/core/platform/sources/telegram/inline_registry.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..a495df80b024e896b27e97762479d90c93aa27c9
+--- /dev/null
++++ b/astrbot/core/platform/sources/telegram/inline_registry.py
+@@ -0,0 +1,91 @@
++from __future__ import annotations
++
++import hashlib
++import time
++from dataclasses import dataclass
++from typing import Literal
++
++from astrbot.core.star.star_handler import StarHandlerMetadata
++
++InlineTargetKind = Literal["llm", "plugin"]
++
++
++@dataclass(slots=True)
++class TelegramInlineTarget:
++    kind: InlineTargetKind
++    query: str
++    handlers: list[StarHandlerMetadata] | None = None
++    plugin_module_path: str | None = None
++    plugin_name: str | None = None
++    use_command_flow: bool = False
++    created_at: float = 0.0
++
++
++class TelegramInlineResultRegistry:
++    """Short-lived mapping from Telegram inline result IDs to AstrBot targets."""
++
++    def __init__(self, ttl_seconds: float = 300.0, max_items: int = 512) -> None:
++        self.ttl_seconds = ttl_seconds
++        self.max_items = max_items
++        self._targets: dict[str, TelegramInlineTarget] = {}
++
++    def register(
++        self,
++        *,
++        inline_query_id: str,
++        kind: InlineTargetKind,
++        query: str,
++        ordinal: int,
++        handlers: list[StarHandlerMetadata] | None = None,
++        plugin_module_path: str | None = None,
++        plugin_name: str | None = None,
++        use_command_flow: bool = False,
++    ) -> str:
++        self.prune()
++        seed = f"{inline_query_id}:{kind}:{plugin_module_path or ''}:{ordinal}"
++        digest = hashlib.blake2b(seed.encode("utf-8"), digest_size=8).hexdigest()
++        result_id = f"ab-{digest}"
++        self._targets[result_id] = TelegramInlineTarget(
++            kind=kind,
++            query=query,
++            handlers=list(handlers or []),
++            plugin_module_path=plugin_module_path,
++            plugin_name=plugin_name,
++            use_command_flow=use_command_flow,
++            created_at=time.monotonic(),
++        )
++        if len(self._targets) > self.max_items:
++            self._drop_oldest()
++        return result_id
++
++    def resolve(self, result_id: str) -> TelegramInlineTarget | None:
++        target = self._targets.get(result_id)
++        if target is None:
++            return None
++        if time.monotonic() - target.created_at > self.ttl_seconds:
++            self._targets.pop(result_id, None)
++            return None
++        return target
++
++    def prune(self) -> None:
++        now = time.monotonic()
++        expired = [
++            result_id
++            for result_id, target in self._targets.items()
++            if now - target.created_at > self.ttl_seconds
++        ]
++        for result_id in expired:
++            self._targets.pop(result_id, None)
++
++    def clear(self) -> None:
++        self._targets.clear()
++
++    def _drop_oldest(self) -> None:
++        oldest = min(
++            self._targets,
++            key=lambda result_id: self._targets[result_id].created_at,
++        )
++        self._targets.pop(oldest, None)
++
++
++telegram_inline_result_registry = TelegramInlineResultRegistry()
+diff --git a/astrbot/core/platform/sources/telegram/tg_event.py b/astrbot/core/platform/sources/telegram/tg_event.py
+index a2b9f6d6842649af7f5a4189c50f3492c4da7176..af0967fdcf0f624bdb2a9a9e9cfcf0d52d0053b1 100644
+--- a/astrbot/core/platform/sources/telegram/tg_event.py
++++ b/astrbot/core/platform/sources/telegram/tg_event.py
+@@ -1085,7 +1085,7 @@ class TelegramInlineQueryEvent(AstrMessageEvent):
+         if not text:
+             return []
+         chunks = TelegramPlatformEvent._split_message(text)
+-        thumb_url = "https://user-images.githubusercontent.com/11541888/223106202-7576ff11-2c8e-408d-94ea-b02a7a32149a.png"
++        thumb_url = "https://raw.githubusercontent.com/AstrBotDevs/AstrBot/7c39abc6b5ce0e61c10ed2d7c41a4079d771d6cf/dashboard/src/assets/images/astrbot_logo_mini.webp"
+         if self._INLINE_ARTICLE_PARAMS is None:
+             try:
+                 self._INLINE_ARTICLE_PARAMS = set(
+@@ -1129,6 +1129,54 @@ class TelegramInlineQueryEvent(AstrMessageEvent):
+             )
+         return results
+ 
++    async def _build_inline_option_results(
++        self, options: list[dict[str, Any]]
++    ) -> list[InlineQueryResultArticle]:
++        if self._INLINE_ARTICLE_PARAMS is None:
++            try:
++                self._INLINE_ARTICLE_PARAMS = set(
++                    inspect.signature(InlineQueryResultArticle).parameters.keys(),
++                )
++            except Exception:
++                self._INLINE_ARTICLE_PARAMS = set()
++
++        thumb_url = "https://raw.githubusercontent.com/AstrBotDevs/AstrBot/7c39abc6b5ce0e61c10ed2d7c41a4079d771d6cf/dashboard/src/assets/images/astrbot_logo_mini.webp"
++        query_preview = self.query or "inline query"
++        results: list[InlineQueryResultArticle] = []
++        for option in options[: self.MAX_INLINE_RESULTS]:
++            title = str(option.get("title") or "AstrBot")
++            description = str(option.get("description") or "")
++            if len(description) > self.MAX_INLINE_DESCRIPTION_LEN:
++                description = description[: self.MAX_INLINE_DESCRIPTION_LEN - 3] + "..."
++            placeholder = f"{title} is preparing a response for: {query_preview}"
++            kwargs = {
++                "id": str(option["id"]),
++                "title": title,
++                "description": description,
++                "input_message_content": InputTextMessageContent(
++                    message_text=placeholder[
++                        : TelegramPlatformEvent.MAX_MESSAGE_LENGTH
++                    ],
++                ),
++                "reply_markup": InlineKeyboardMarkup(
++                    [
++                        [
++                            InlineKeyboardButton(
++                                "Waiting for response",
++                                callback_data="astrbot_inline_waiting",
++                            )
++                        ]
++                    ],
++                ),
++            }
++            if thumb_url:
++                if "thumb_url" in self._INLINE_ARTICLE_PARAMS:
++                    kwargs["thumb_url"] = thumb_url
++                elif "thumbnail_url" in self._INLINE_ARTICLE_PARAMS:
++                    kwargs["thumbnail_url"] = thumb_url
++            results.append(InlineQueryResultArticle(**kwargs))
++        return results
++
+     async def _answer_inline_query(self, text: str) -> None:
+         results = await self._build_inline_results(text)
+         if not results:
+@@ -1147,6 +1195,21 @@ class TelegramInlineQueryEvent(AstrMessageEvent):
+         except Exception as e:
+             logger.warning(f"answer_inline_query 失败: {e!s}")
+ 
++    async def answer_inline_options(self, options: list[dict[str, Any]]) -> None:
++        results = await self._build_inline_option_results(options)
++        if not results:
++            logger.warning("TelegramInlineQueryEvent 无可用选项，跳过响应。")
++            return
++        try:
++            await self.client.answer_inline_query(
++                inline_query_id=self.inline_query_id,
++                results=results,
++                cache_time=0,
++                is_personal=True,
++            )
++        except Exception as e:
++            logger.warning(f"answer_inline_query 选项响应失败: {e!s}")
++
+     async def send_with_client(
+         self, client: ExtBot, message_chain: MessageChain, user_name: str
+     ) -> None:
+@@ -1577,6 +1640,66 @@ class TelegramChosenInlineResultEvent(AstrMessageEvent):
+             kwargs["parse_mode"] = parse_mode
+         await self.client.edit_message_text(**kwargs)
+ 
++    async def _resolve_inline_photo_media(self, image: Image) -> str | None:
++        media = image.url or image.file
++        if not media:
++            return None
++        if media.startswith(("http://", "https://")):
++            return media
++        if media.startswith("file://") or media.startswith("base64://"):
++            try:
++                return await image.register_to_file_service()
++            except Exception as e:
++                logger.warning(
++                    "Cannot expose local inline image via file service; falling back to text edit: "
++                    f"{e!s}"
++                )
++                return None
++        if os.path.exists(media):
++            try:
++                return await image.register_to_file_service()
++            except Exception as e:
++                logger.warning(
++                    "Cannot expose local inline image via file service; falling back to text edit: "
++                    f"{e!s}"
++                )
++                return None
++        # Telegram accepts existing file_id values when editing inline media.
++        return media
++
++    async def _edit_inline_photo_message(
++        self,
++        image: Image,
++        caption: str | None,
++        reply_markup=None,
++    ) -> bool:
++        if not self.inline_message_id:
++            logger.debug(
++                "TelegramChosenInlineResultEvent 缺少 inline_message_id，跳过媒体编辑。"
++            )
++            return False
++
++        media = await self._resolve_inline_photo_media(image)
++        if not media:
++            return False
++
++        try:
++            await self.client.edit_message_media(
++                inline_message_id=self.inline_message_id,
++                media=InputMediaPhoto(
++                    media=media,
++                    caption=caption[: TelegramPlatformEvent.MAX_CAPTION_LENGTH]
++                    if caption
++                    else None,
++                    has_spoiler=image.use_spoiler,
++                ),
++                reply_markup=reply_markup,
++            )
++            return True
++        except Exception as e:
++            logger.warning(f"编辑内联图片消息失败，回退到文本编辑: {e!s}")
++            return False
++
+     async def send_with_client(
+         self, client: ExtBot, message_chain: MessageChain, user_name: str
+     ) -> None:
+@@ -1602,6 +1725,18 @@ class TelegramChosenInlineResultEvent(AstrMessageEvent):
+                     f"Failed to convert reply_markup to InlineKeyboardMarkup: {e}"
+                 )
+ 
++        first_image = next(
++            (comp for comp in message_chain.chain if isinstance(comp, Image)), None
++        )
++        if first_image is not None:
++            media_caption = message_chain.get_plain_text().strip()
++            if await self._edit_inline_photo_message(
++                first_image,
++                media_caption or None,
++                reply_markup=reply_markup_keyboard,
++            ):
++                return
++
+         full_text, entities = self._build_inline_entities(text)
+         try:
+             await self._edit_inline_message(
+diff --git a/astrbot/core/provider/fallback.py b/astrbot/core/provider/fallback.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..fbedb254e3bb9ddfd126bf2999054934170c4be5
+--- /dev/null
++++ b/astrbot/core/provider/fallback.py
+@@ -0,0 +1,49 @@
++from __future__ import annotations
++
++from typing import Any
++
++from astrbot import logger
++
++from .provider import Provider
++
++
++def get_fallback_chat_providers(
++    provider: Provider,
++    plugin_context: Any,
++    provider_settings: dict[str, Any] | None,
++) -> list[Provider]:
++    """Resolve fallback chat providers for a provider selection."""
++    if not isinstance(provider_settings, dict):
++        logger.warning("provider_settings is not a dict, skip fallback providers.")
++        return []
++
++    fallback_ids = provider_settings.get("fallback_chat_models", [])
++    if not isinstance(fallback_ids, list):
++        logger.warning(
++            "fallback_chat_models setting is not a list, skip fallback providers."
++        )
++        return []
++
++    provider_id = str(provider.provider_config.get("id", ""))
++    seen_provider_ids: set[str] = {provider_id} if provider_id else set()
++    fallbacks: list[Provider] = []
++
++    for fallback_id in fallback_ids:
++        if not isinstance(fallback_id, str) or not fallback_id:
++            continue
++        if fallback_id in seen_provider_ids:
++            continue
++        fallback_provider = plugin_context.get_provider_by_id(fallback_id)
++        if fallback_provider is None:
++            logger.warning("Fallback chat provider `%s` not found, skip.", fallback_id)
++            continue
++        if not isinstance(fallback_provider, Provider):
++            logger.warning(
++                "Fallback chat provider `%s` is invalid type: %s, skip.",
++                fallback_id,
++                type(fallback_provider),
++            )
++            continue
++        fallbacks.append(fallback_provider)
++        seen_provider_ids.add(fallback_id)
++    return fallbacks
+diff --git a/astrbot/core/subagent_orchestrator.py b/astrbot/core/subagent_orchestrator.py
+index c6c595dfc9fd94fe04ab32a09b8da3952ba11935..5fa1339ea31baa4e21afbb99cfef67fd69734f04 100644
+--- a/astrbot/core/subagent_orchestrator.py
++++ b/astrbot/core/subagent_orchestrator.py
+@@ -12,6 +12,9 @@ if TYPE_CHECKING:
+     from astrbot.core.persona_mgr import PersonaManager
+ 
+ 
++HANDOFF_HANDLER_MODULE_PATH = "core.subagent_orchestrator"
++
++
+ class SubAgentOrchestrator:
+     """Loads subagent definitions from config and registers handoff tools.
+ 
+@@ -70,7 +73,7 @@ class SubAgentOrchestrator:
+                 begin_dialogs = copy.deepcopy(
+                     persona_data.get("_begin_dialogs_processed")
+                 )
+-                tools = persona_data.get("tools")
++                tools = persona_data.get("tools", [])
+                 if public_description == "" and prompt:
+                     public_description = prompt[:120]
+             if tools is None:
+@@ -92,6 +95,7 @@ class SubAgentOrchestrator:
+                 agent=agent,
+                 tool_description=public_description or None,
+             )
++            handoff.handler_module_path = HANDOFF_HANDLER_MODULE_PATH
+ 
+             # Optional per-subagent chat provider override.
+             handoff.provider_id = provider_id
+@@ -102,3 +106,15 @@ class SubAgentOrchestrator:
+             logger.info(f"Registered subagent handoff tool: {handoff.name}")
+ 
+         self.handoffs = handoffs
++
++    def get_handoff(self, name: str) -> HandoffTool | None:
++        for handoff in self.handoffs:
++            if handoff.name == name and handoff.active:
++                return handoff
++        for handoff in self.handoffs:
++            if handoff.name == name:
++                return handoff
++        return None
++
++    def is_handoff_tool_name(self, name: str) -> bool:
++        return self.get_handoff(name) is not None
+diff --git a/astrbot/dashboard/routes/persona.py b/astrbot/dashboard/routes/persona.py
+index 56c14fe61779c656d69ace8b65089de692c1f5c9..ef65b374b36d479816c186b614acbc5b7f71deab 100644
+--- a/astrbot/dashboard/routes/persona.py
++++ b/astrbot/dashboard/routes/persona.py
+@@ -123,7 +123,7 @@ class PersonaRoute(Route):
+             persona_id = data.get("persona_id", "").strip()
+             system_prompt = data.get("system_prompt", "").strip()
+             begin_dialogs = data.get("begin_dialogs", [])
+-            tools = data.get("tools")
++            tools = data.get("tools") if "tools" in data else []
+             skills = data.get("skills")
+             custom_error_message = data.get("custom_error_message")
+             folder_id = data.get("folder_id")  # None 表示根目录
+@@ -152,8 +152,8 @@ class PersonaRoute(Route):
+                 persona_id=persona_id,
+                 system_prompt=system_prompt,
+                 begin_dialogs=begin_dialogs if begin_dialogs else None,
+-                tools=tools if tools else None,
+-                skills=skills if skills else None,
++                tools=tools,
++                skills=skills,
+                 custom_error_message=custom_error_message,
+                 folder_id=folder_id,
+                 sort_order=sort_order,
+@@ -168,8 +168,8 @@ class PersonaRoute(Route):
+                             "persona_id": persona.persona_id,
+                             "system_prompt": persona.system_prompt,
+                             "begin_dialogs": persona.begin_dialogs or [],
+-                            "tools": persona.tools or [],
+-                            "skills": persona.skills or [],
++                            "tools": persona.tools,
++                            "skills": persona.skills,
+                             "custom_error_message": persona.custom_error_message,
+                             "folder_id": persona.folder_id,
+                             "sort_order": persona.sort_order,
+diff --git a/astrbot/dashboard/routes/subagent.py b/astrbot/dashboard/routes/subagent.py
+index e3d77f73ad23290a7aca02cae55290fd72acdf5a..eef6600acaca6c55cd3e51071ba4e31fd17a3146 100644
+--- a/astrbot/dashboard/routes/subagent.py
++++ b/astrbot/dashboard/routes/subagent.py
+@@ -5,6 +5,7 @@ from quart import jsonify, request
+ from astrbot.core import logger
+ from astrbot.core.agent.handoff import HandoffTool
+ from astrbot.core.core_lifecycle import AstrBotCoreLifecycle
++from astrbot.core.subagent_orchestrator import HANDOFF_HANDLER_MODULE_PATH
+ 
+ from .route import Response, Route, RouteContext
+ 
+@@ -100,7 +101,7 @@ class SubAgentRoute(Route):
+                 # the handoff (transfer_to_*) tools as their own mounted tools.
+                 if isinstance(tool, HandoffTool):
+                     continue
+-                if tool.handler_module_path == "core.subagent_orchestrator":
++                if tool.handler_module_path == HANDOFF_HANDLER_MODULE_PATH:
+                     continue
+                 tools_dict.append(
+                     {
+diff --git a/astrbot/dashboard/routes/tools.py b/astrbot/dashboard/routes/tools.py
+index 157b4d75bfb10d3b84e96a1dd77f10193031ccdb..0e36c02c9464613c518202621a3246d8794913e7 100644
+--- a/astrbot/dashboard/routes/tools.py
++++ b/astrbot/dashboard/routes/tools.py
+@@ -3,6 +3,7 @@ import traceback
+ from quart import request
+ 
+ from astrbot.core import logger
++from astrbot.core.agent.handoff import HandoffTool
+ from astrbot.core.agent.mcp_client import MCPTool, validate_mcp_stdio_config
+ from astrbot.core.core_lifecycle import AstrBotCoreLifecycle
+ from astrbot.core.star import star_map
+@@ -449,6 +450,16 @@ class ToolsRoute(Route):
+             for tool in self.tool_mgr.iter_builtin_tools():
+                 if tool.name not in existing_names:
+                     tools.append(tool)
++                    existing_names.add(tool.name)
++
++            subagent_orchestrator = getattr(
++                self.core_lifecycle, "subagent_orchestrator", None
++            )
++            if subagent_orchestrator:
++                for tool in subagent_orchestrator.handoffs:
++                    if tool.name not in existing_names:
++                        tools.append(tool)
++                        existing_names.add(tool.name)
+ 
+             conf_list = self.core_lifecycle.astrbot_config_mgr.get_conf_list()
+             conf_name_map = {conf["id"]: conf["name"] for conf in conf_list}
+@@ -480,6 +491,9 @@ class ToolsRoute(Route):
+                         for status in builtin_config_statuses
+                         if status["enabled"]
+                     ]
++                elif isinstance(tool, HandoffTool):
++                    origin = "subagent"
++                    origin_name = tool.agent.name
+                 elif isinstance(tool, MCPTool):
+                     origin = "mcp"
+                     origin_name = tool.mcp_server_name
+diff --git a/changelogs/v4.23.0-beta.1.md b/changelogs/v4.23.0-beta.1.md
+index 398d7fcece8340fac2f9300e2abc2f0c3bd55cd9..8cacaed3aa65a1dac2d8a3e323717d16ddae7f50 100644
+--- a/changelogs/v4.23.0-beta.1.md
++++ b/changelogs/v4.23.0-beta.1.md
+@@ -40,6 +40,7 @@
+ - 修复 `faiss` 在启动阶段过早导入导致部分环境启动失败的问题。（[#7400](https://github.com/AstrBotDevs/AstrBot/pull/7400)）
+ - 修复微信个人号适配器缺少上下文 token 时的警告信息。（[commit](https://github.com/AstrBotDevs/AstrBot/commit/dfca5cdb)）
+ - 修复工具结果断言与动态阈值不一致的问题。（[commit](https://github.com/AstrBotDevs/AstrBot/commit/8c6c00ae)）
++- 修复 SubAgent handoff 的 provider fallback 同步逻辑，并明确显式 provider 覆盖时不再使用 fallback。
+ 
+ <a id="english"></a>
+ 
+@@ -81,3 +82,4 @@
+ - Deferred `faiss` imports during startup to avoid startup failures in some environments. ([#7400](https://github.com/AstrBotDevs/AstrBot/pull/7400))
+ - Improved the missing-context-token warning message in the Weixin OC adapter. ([commit](https://github.com/AstrBotDevs/AstrBot/commit/dfca5cdb))
+ - Updated tool-result assertions to match dynamic threshold values. ([commit](https://github.com/AstrBotDevs/AstrBot/commit/8c6c00ae))
++- Fixed SubAgent handoff provider fallback synchronization and clarified that explicit provider overrides bypass fallback.
+diff --git a/dashboard/src/components/shared/PersonaForm.vue b/dashboard/src/components/shared/PersonaForm.vue
+index 95aa77f6669b60f4c98dfb5966652a5a64efc874..75af7086e24dd215c52a44eebc231f99e9b3aa18 100644
+--- a/dashboard/src/components/shared/PersonaForm.vue
++++ b/dashboard/src/components/shared/PersonaForm.vue
+@@ -530,8 +530,8 @@ export default {
+                 system_prompt: '',
+                 custom_error_message: '',
+                 begin_dialogs: [],
+-                tools: [],
+-                skills: [],
++                tools: null,
++                skills: null,
+                 folder_id: this.currentFolderId
+             };
+             this.toolSelectValue = '0';
+diff --git a/dashboard/src/i18n/locales/en-US/features/subagent.json b/dashboard/src/i18n/locales/en-US/features/subagent.json
+index e9ea127f51d5ebbdae643b741d6185509d4d3f78..3d85056748cd35c046e5db14b742d1ae8a58fc3e 100644
+--- a/dashboard/src/i18n/locales/en-US/features/subagent.json
++++ b/dashboard/src/i18n/locales/en-US/features/subagent.json
+@@ -33,7 +33,7 @@
+   },
+   "description": {
+     "disabled": "When off: SubAgent is disabled; the main LLM mounts tools via persona rules (all by default) and calls them directly.",
+-    "enabled": "When on: the main LLM keeps its own tools and mounts transfer_to_* delegate tools. With deduplication, tools overlapping with SubAgents are removed from the main tool set."
++    "enabled": "When on: the main LLM can use transfer_to_* delegate tools selected by the active persona. With deduplication, tools overlapping with selected SubAgents are removed from the main tool set."
+   },
+   "section": {
+     "title": "SubAgents",
+diff --git a/dashboard/src/i18n/locales/ru-RU/features/subagent.json b/dashboard/src/i18n/locales/ru-RU/features/subagent.json
+index 4f6b298b4d988c2c59cf70ccb0bd570987b1c97b..e42e26809ccc855952488f18628cae2f2599e69e 100644
+--- a/dashboard/src/i18n/locales/ru-RU/features/subagent.json
++++ b/dashboard/src/i18n/locales/ru-RU/features/subagent.json
+@@ -33,7 +33,7 @@
+     },
+     "description": {
+         "disabled": "Выключено: SubAgent отключен; основной LLM подключает инструменты согласно правилам персонажа (все по умолчанию) и вызывает их напрямую.",
+-        "enabled": "Включено: основной LLM сохраняет свои инструменты и подключает инструменты делегирования transfer_to_*. При дедупликации инструменты, пересекающиеся с SubAgent, удаляются из основного набора."
++        "enabled": "Включено: основной LLM может использовать инструменты делегирования transfer_to_*, выбранные активным персонажем. При дедупликации инструменты, пересекающиеся с выбранными SubAgent, удаляются из основного набора."
+     },
+     "section": {
+         "title": "Субагенты",
+diff --git a/dashboard/src/i18n/locales/zh-CN/features/subagent.json b/dashboard/src/i18n/locales/zh-CN/features/subagent.json
+index cd49ae432da1bb005546246b3dc91940c43261e6..70fabed485bd7ce061b89e4b97a556484b57602a 100644
+--- a/dashboard/src/i18n/locales/zh-CN/features/subagent.json
++++ b/dashboard/src/i18n/locales/zh-CN/features/subagent.json
+@@ -33,7 +33,7 @@
+   },
+   "description": {
+     "disabled": "未启动子代理编排功能。",
+-    "enabled": "子代理将作为工具放在主代理的工具集中，主代理会在适当的时机调用子代理完成任务。"
++    "enabled": "主代理可使用当前人格选中的 transfer_to_* 子代理工具，并在适当时机委派任务。"
+   },
+   "section": {
+     "title": "子代理配置",
+diff --git a/docs/en/use/subagent.md b/docs/en/use/subagent.md
+index da6e5a728f04b7b69fa790398bd2268c0a4485bf..6e637c672bae7c6345b0f1fa11e2410fa638172a 100644
+--- a/docs/en/use/subagent.md
++++ b/docs/en/use/subagent.md
+@@ -42,6 +42,8 @@ Click the "Add SubAgent" button:
+ - **Assign Tools**: Select the tools this SubAgent can invoke.
+ - **Provider Override (Optional)**: You can specify different model providers for specific SubAgents. For example, the Main Agent could use GPT-4o, while a simple query SubAgent uses GPT-4o-mini to save costs.
+ 
++> Note: if a SubAgent has an explicit `Provider` override, it will use that `Provider` directly and will not use fallback providers. Fallback only applies when no `Provider` is specified, in which case AstrBot first uses the current conversation's Main Agent provider and falls back only on failure.
++
+ ## Best Practices
+ 
+ - **Single Responsibility**: Each SubAgent should handle one category of related tasks (e.g., search, file processing, smart home control).
+diff --git a/docs/zh/use/subagent.md b/docs/zh/use/subagent.md
+index 5c2a20d7279305a6829ce775252ecbe4ffd2e3c3..a06a82f427be489eef43d4d1ab55689b7735748c 100644
+--- a/docs/zh/use/subagent.md
++++ b/docs/zh/use/subagent.md
+@@ -42,6 +42,8 @@ SubAgent 编排是 AstrBot 提供的一种高级 Agent 组织方式。它允许
+ - **分配工具**：选择该子 Agent 可以调用的工具。
+ - **Provider 覆盖（可选）**：你可以为特定的子 Agent 指定不同的模型提供商。例如，主 Agent 使用 GPT-4o，而负责简单查询的子 Agent 使用 GPT-4o-mini 以节省成本。
+ 
++> 注意：如果子 Agent 显式指定了 `Provider`，它将直接使用该 `Provider`，不会再走 fallback。只有未指定 `Provider` 时，才会先使用主 Agent 当前会话的 `Provider`，失败后再尝试 fallback 列表。
++
+ ## 最佳实践
+ 
+ - **职责单一**：每个 SubAgent 应该只负责一类相关的任务（如：搜索、文件处理、智能家居控制）。
+diff --git a/tests/unit/test_astr_agent_tool_exec.py b/tests/unit/test_astr_agent_tool_exec.py
+index 5fab9fe0a27d54b1fa5e1e3804319403ea21aa9e..e68ed28e0ede1cb0371265300c708cfe87b3fcec 100644
+--- a/tests/unit/test_astr_agent_tool_exec.py
++++ b/tests/unit/test_astr_agent_tool_exec.py
+@@ -1,4 +1,5 @@
+ from types import SimpleNamespace
++from unittest.mock import MagicMock
+ 
+ import mcp
+ import pytest
+@@ -6,15 +7,21 @@ import pytest
+ from astrbot.core.agent.run_context import ContextWrapper
+ from astrbot.core.astr_agent_tool_exec import FunctionToolExecutor
+ from astrbot.core.message.components import Image
++from astrbot.core.provider.provider import Provider
+ 
+ 
+ class _DummyEvent:
+-    def __init__(self, message_components: list[object] | None = None) -> None:
++    def __init__(
++        self,
++        message_components: list[object] | None = None,
++        extras: dict[str, object] | None = None,
++    ) -> None:
+         self.unified_msg_origin = "webchat:FriendMessage:webchat!user!session"
+         self.message_obj = SimpleNamespace(message=message_components or [])
++        self._extras = extras or {}
+ 
+-    def get_extra(self, _key: str):
+-        return None
++    def get_extra(self, key: str):
++        return self._extras.get(key)
+ 
+ 
+ class _DummyTool:
+@@ -187,8 +194,12 @@ async def test_execute_handoff_skips_renormalize_when_image_urls_prepared(
+         captured.update(kwargs)
+         return SimpleNamespace(completion_text="ok")
+ 
++    provider = MagicMock(spec=Provider)
++    provider.provider_config = {"id": "provider-id"}
++
+     context = SimpleNamespace(
+         get_current_chat_provider_id=_fake_get_current_chat_provider_id,
++        get_provider_by_id=lambda _provider_id: provider,
+         tool_loop_agent=_fake_tool_loop_agent,
+         get_config=lambda **_kwargs: {"provider_settings": {}},
+     )
+@@ -285,8 +296,12 @@ async def test_execute_handoff_passes_tool_call_timeout_to_tool_loop_agent(
+         captured.update(kwargs)
+         return SimpleNamespace(completion_text="ok")
+ 
++    provider = MagicMock(spec=Provider)
++    provider.provider_config = {"id": "provider-id"}
++
+     context = SimpleNamespace(
+         get_current_chat_provider_id=_fake_get_current_chat_provider_id,
++        get_provider_by_id=lambda _provider_id: provider,
+         tool_loop_agent=_fake_tool_loop_agent,
+         get_config=lambda **_kwargs: {"provider_settings": {}},
+     )
+@@ -321,6 +336,110 @@ async def test_execute_handoff_passes_tool_call_timeout_to_tool_loop_agent(
+     assert captured["tool_call_timeout"] == 120
+ 
+ 
++@pytest.mark.asyncio
++@pytest.mark.parametrize(
++    (
++        "tool_provider_id",
++        "selected_provider_id",
++        "resolved_provider_id",
++        "current_provider_id",
++        "expect_fallback",
++    ),
++    [
++        ("explicit-provider", None, "explicit-provider", "current-provider", False),
++        (None, None, "current-provider", "current-provider", True),
++    ],
++)
++async def test_execute_handoff_passes_fallback_providers_and_resolves_provider(
++    monkeypatch: pytest.MonkeyPatch,
++    tool_provider_id: str | None,
++    selected_provider_id: str | None,
++    resolved_provider_id: str,
++    current_provider_id: str,
++    expect_fallback: bool,
++):
++    captured: dict = {}
++    fallback_helper_called = 0
++    provider = MagicMock(spec=Provider)
++    provider.provider_config = {"id": resolved_provider_id}
++    fallback_provider = SimpleNamespace(provider_config={"id": "fallback-provider"})
++
++    async def _fake_get_current_chat_provider_id(_umo):
++        return current_provider_id
++
++    def _fake_get_provider_by_id(provider_id):
++        if provider_id == resolved_provider_id:
++            return provider
++        return None
++
++    async def _fake_tool_loop_agent(**kwargs):
++        captured.update(kwargs)
++        return SimpleNamespace(completion_text="ok")
++
++    def _fake_get_fallback_chat_providers(provider_arg, _ctx, provider_settings):
++        nonlocal fallback_helper_called
++        fallback_helper_called += 1
++        assert provider_arg is provider
++        assert provider_settings == {"fallback_chat_models": ["fallback-provider"]}
++        return [fallback_provider]
++
++    monkeypatch.setattr(
++        "astrbot.core.astr_agent_tool_exec.get_fallback_chat_providers",
++        _fake_get_fallback_chat_providers,
++    )
++
++    event = _DummyEvent(
++        [],
++        extras={"selected_provider": selected_provider_id} if selected_provider_id else {},
++    )
++    run_context = ContextWrapper(
++        context=SimpleNamespace(
++            event=event,
++            context=SimpleNamespace(
++                get_current_chat_provider_id=_fake_get_current_chat_provider_id,
++                get_provider_by_id=_fake_get_provider_by_id,
++                get_config=lambda **_kwargs: {
++                    "provider_settings": {
++                        "fallback_chat_models": ["fallback-provider"],
++                    }
++                },
++                tool_loop_agent=_fake_tool_loop_agent,
++            ),
++        ),
++        tool_call_timeout=120,
++    )
++    tool = SimpleNamespace(
++        name="transfer_to_subagent",
++        provider_id=tool_provider_id,
++        agent=SimpleNamespace(
++            name="subagent",
++            tools=[],
++            instructions="subagent-instructions",
++            begin_dialogs=[],
++            run_hooks=None,
++        ),
++    )
++
++    results = []
++    async for result in FunctionToolExecutor._execute_handoff(
++        tool,
++        run_context,
++        image_urls_prepared=True,
++        input="hello",
++        image_urls=[],
++    ):
++        results.append(result)
++
++    assert len(results) == 1
++    assert captured["fallback_providers"] == (
++        [fallback_provider] if expect_fallback else []
++    )
++    assert captured["chat_provider_id"] == resolved_provider_id
++    assert captured["max_steps"] == 30
++    assert captured["stream"] is False
++    assert fallback_helper_called == (1 if expect_fallback else 0)
++
++
+ @pytest.mark.asyncio
+ async def test_collect_handoff_image_urls_filters_extensionless_file_outside_temp_root(
+     monkeypatch: pytest.MonkeyPatch,
+diff --git a/tests/unit/test_astr_main_agent.py b/tests/unit/test_astr_main_agent.py
+index f88df3cf6cecc53d4d2aad8a2cefd28876599e58..74bfa075dbfae6c4c2bb2169039872275f7b1c72 100644
+--- a/tests/unit/test_astr_main_agent.py
++++ b/tests/unit/test_astr_main_agent.py
+@@ -6,6 +6,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
+ import pytest
+ 
+ from astrbot.core import astr_main_agent as ama
++from astrbot.core.agent.agent import Agent
++from astrbot.core.agent.handoff import HandoffTool
+ from astrbot.core.agent.mcp_client import MCPTool
+ from astrbot.core.agent.tool import FunctionTool, ToolSet
+ from astrbot.core.conversation_mgr import Conversation
+@@ -588,10 +590,8 @@ class TestEnsurePersonaAndSkills:
+         assert req.func_tool is not None
+ 
+     @pytest.mark.asyncio
+-    async def test_subagent_dedupe_uses_default_persona_tools(
+-        self, mock_event, mock_context
+-    ):
+-        """Test dedupe uses resolved default persona tools in subagent mode."""
++    async def test_subagent_handoff_is_not_auto_mounted(self, mock_event, mock_context):
++        """Subagent handoffs are exposed only through persona tool selection."""
+         module = ama
+         mock_context.persona_manager.resolve_selected_persona = AsyncMock(
+             return_value=(None, None, None, False)
+@@ -640,11 +640,204 @@ class TestEnsurePersonaAndSkills:
+ 
+         await module._ensure_persona_and_skills(req, {}, mock_context, mock_event)
+ 
++        assert req.func_tool is not None
++        assert "transfer_to_planner" not in req.func_tool.names()
++        assert "tool_a" in req.func_tool.names()
++        assert "tool_b" in req.func_tool.names()
++
++    @pytest.mark.asyncio
++    async def test_subagent_dedupe_uses_selected_handoff_persona_tools(
++        self, mock_event, mock_context
++    ):
++        """Test dedupe uses selected handoff subagent persona tools."""
++        module = ama
++        router_persona = {
++            "prompt": "router prompt",
++            "tools": ["transfer_to_planner", "tool_a", "tool_b"],
++            "skills": None,
++        }
++        mock_context.persona_manager.resolve_selected_persona = AsyncMock(
++            return_value=("router", router_persona, None, False)
++        )
++        mock_context.persona_manager.get_persona_v3_by_id = MagicMock(
++            return_value={"name": "default", "tools": ["tool_a"]}
++        )
++
++        tool_a = FunctionTool(
++            name="tool_a",
++            parameters={"type": "object", "properties": {}},
++            description="tool a",
++        )
++        tool_b = FunctionTool(
++            name="tool_b",
++            parameters={"type": "object", "properties": {}},
++            description="tool b",
++        )
++        tmgr = mock_context.get_llm_tool_manager.return_value
++        tmgr.func_list = [tool_a, tool_b]
++        tmgr.get_full_tool_set.return_value = ToolSet([tool_a, tool_b])
++        tmgr.get_func.side_effect = lambda name: {
++            "tool_a": tool_a,
++            "tool_b": tool_b,
++        }.get(name)
++
++        handoff = HandoffTool(
++            agent=Agent(
++                name="planner",
++                instructions="planner prompt",
++                tools=["tool_a"],
++            )
++        )
++        mock_context.subagent_orchestrator = MagicMock(handoffs=[handoff])
++        mock_context.subagent_orchestrator.get_handoff.side_effect = lambda name: {
++            handoff.name: handoff,
++        }.get(name)
++        mock_context.get_config.return_value = {
++            "subagent_orchestrator": {
++                "main_enable": True,
++                "remove_main_duplicate_tools": True,
++                "agents": [
++                    {
++                        "name": "planner",
++                        "enabled": True,
++                        "persona_id": "default",
++                    }
++                ],
++            }
++        }
++
++        req = ProviderRequest()
++        req.conversation = MagicMock(persona_id="router")
++
++        await module._ensure_persona_and_skills(req, {}, mock_context, mock_event)
++
+         assert req.func_tool is not None
+         assert "transfer_to_planner" in req.func_tool.names()
+         assert "tool_a" not in req.func_tool.names()
+         assert "tool_b" in req.func_tool.names()
+ 
++    @pytest.mark.asyncio
++    async def test_subagent_handoff_is_mounted_when_persona_uses_all_tools(
++        self, mock_event, mock_context
++    ):
++        """Persona tools=None should include available subagent handoff tools."""
++        module = ama
++        router_persona = {
++            "prompt": "router prompt",
++            "tools": None,
++            "skills": None,
++        }
++        mock_context.persona_manager.resolve_selected_persona = AsyncMock(
++            return_value=("router", router_persona, None, False)
++        )
++        mock_context.persona_manager.get_persona_v3_by_id = MagicMock(
++            return_value={"name": "default", "tools": ["tool_a"]}
++        )
++
++        tool_a = FunctionTool(
++            name="tool_a",
++            parameters={"type": "object", "properties": {}},
++            description="tool a",
++        )
++        tool_b = FunctionTool(
++            name="tool_b",
++            parameters={"type": "object", "properties": {}},
++            description="tool b",
++        )
++        tmgr = mock_context.get_llm_tool_manager.return_value
++        tmgr.func_list = [tool_a, tool_b]
++        tmgr.get_full_tool_set.return_value = ToolSet([tool_a, tool_b])
++        tmgr.get_func.side_effect = lambda name: {
++            "tool_a": tool_a,
++            "tool_b": tool_b,
++        }.get(name)
++
++        handoff = HandoffTool(
++            agent=Agent(
++                name="planner",
++                instructions="planner prompt",
++                tools=["tool_a"],
++            )
++        )
++        mock_context.subagent_orchestrator = MagicMock(handoffs=[handoff])
++        mock_context.get_config.return_value = {
++            "subagent_orchestrator": {
++                "main_enable": True,
++                "remove_main_duplicate_tools": True,
++                "agents": [
++                    {
++                        "name": "planner",
++                        "enabled": True,
++                        "persona_id": "default",
++                    }
++                ],
++            }
++        }
++
++        req = ProviderRequest()
++        req.conversation = MagicMock(persona_id="router")
++
++        await module._ensure_persona_and_skills(req, {}, mock_context, mock_event)
++
++        assert req.func_tool is not None
++        assert "transfer_to_planner" in req.func_tool.names()
++        assert "tool_a" not in req.func_tool.names()
++        assert "tool_b" in req.func_tool.names()
++
++    @pytest.mark.asyncio
++    async def test_persona_missing_tools_field_does_not_use_all_tools(
++        self, mock_event, mock_context
++    ):
++        """Missing tools is treated as no explicit tool selection."""
++        module = ama
++        router_persona = {
++            "prompt": "router prompt",
++            "skills": None,
++        }
++        mock_context.persona_manager.resolve_selected_persona = AsyncMock(
++            return_value=("router", router_persona, None, False)
++        )
++
++        tool_a = FunctionTool(
++            name="tool_a",
++            parameters={"type": "object", "properties": {}},
++            description="tool a",
++        )
++        tmgr = mock_context.get_llm_tool_manager.return_value
++        tmgr.func_list = [tool_a]
++        tmgr.get_full_tool_set.return_value = ToolSet([tool_a])
++        tmgr.get_func.side_effect = lambda name: {"tool_a": tool_a}.get(name)
++
++        handoff = HandoffTool(
++            agent=Agent(
++                name="planner",
++                instructions="planner prompt",
++                tools=["tool_a"],
++            )
++        )
++        mock_context.subagent_orchestrator = MagicMock(handoffs=[handoff])
++        mock_context.get_config.return_value = {
++            "subagent_orchestrator": {
++                "main_enable": True,
++                "remove_main_duplicate_tools": False,
++                "agents": [
++                    {
++                        "name": "planner",
++                        "enabled": True,
++                        "persona_id": "default",
++                    }
++                ],
++            }
++        }
++
++        req = ProviderRequest()
++        req.conversation = MagicMock(persona_id="router")
++
++        await module._ensure_persona_and_skills(req, {}, mock_context, mock_event)
++
++        assert req.func_tool is not None
++        assert req.func_tool.names() == []
++
+ 
+ class TestDecorateLlmRequest:
+     """Tests for _decorate_llm_request function."""
+@@ -953,6 +1146,10 @@ class TestBuildMainAgent:
+         with (
+             patch("astrbot.core.astr_main_agent.AgentRunner") as mock_runner_cls,
+             patch("astrbot.core.astr_main_agent.AstrAgentContext"),
++            patch(
++                "astrbot.core.astr_main_agent.get_fallback_chat_providers",
++                return_value=["fallback-provider"],
++            ) as mock_get_fallback_chat_providers,
+         ):
+             mock_runner = MagicMock()
+             mock_runner.reset = AsyncMock()
+@@ -999,6 +1196,10 @@ class TestBuildMainAgent:
+         with (
+             patch("astrbot.core.astr_main_agent.AgentRunner") as mock_runner_cls,
+             patch("astrbot.core.astr_main_agent.AstrAgentContext"),
++            patch(
++                "astrbot.core.astr_main_agent.get_fallback_chat_providers",
++                return_value=["fallback-provider"],
++            ) as mock_get_fallback_chat_providers,
+         ):
+             mock_runner = MagicMock()
+             mock_runner.reset = AsyncMock()
+@@ -1054,6 +1255,10 @@ class TestBuildMainAgent:
+         with (
+             patch("astrbot.core.astr_main_agent.AgentRunner") as mock_runner_cls,
+             patch("astrbot.core.astr_main_agent.AstrAgentContext"),
++            patch(
++                "astrbot.core.astr_main_agent.get_fallback_chat_providers",
++                return_value=["fallback-provider"],
++            ) as mock_get_fallback_chat_providers,
+         ):
+             mock_runner = MagicMock()
+             mock_runner.reset = AsyncMock()
+@@ -1107,6 +1312,10 @@ class TestBuildMainAgent:
+         with (
+             patch("astrbot.core.astr_main_agent.AgentRunner") as mock_runner_cls,
+             patch("astrbot.core.astr_main_agent.AstrAgentContext"),
++            patch(
++                "astrbot.core.astr_main_agent.get_fallback_chat_providers",
++                return_value=["fallback-provider"],
++            ) as mock_get_fallback_chat_providers,
+         ):
+             mock_runner = MagicMock()
+             mock_runner.reset = AsyncMock()
+@@ -1121,7 +1330,11 @@ class TestBuildMainAgent:
+ 
+         assert result is not None
+         assert result.reset_coro is not None
++        mock_get_fallback_chat_providers.assert_called_once()
+         mock_runner.reset.assert_called_once()
++        assert mock_runner.reset.call_args.kwargs["fallback_providers"] == [
++            "fallback-provider"
++        ]
+         result.reset_coro.close()
+ 
+     @pytest.mark.asyncio
+diff --git a/tests/unit/test_provider_fallback.py b/tests/unit/test_provider_fallback.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..02e98ab69586123af7ef6af875276a05fb740710
+--- /dev/null
++++ b/tests/unit/test_provider_fallback.py
+@@ -0,0 +1,80 @@
++from types import SimpleNamespace
++from unittest.mock import MagicMock, patch
++
++from astrbot.core.provider.provider import Provider
++from astrbot.core.provider.fallback import get_fallback_chat_providers
++
++
++def test_get_fallback_chat_providers_filters_invalid_entries_and_duplicates():
++    provider = MagicMock(spec=Provider)
++    provider.provider_config = {"id": "main-provider"}
++    fallback_a = MagicMock(spec=Provider)
++    fallback_a.provider_config = {"id": "fallback-a"}
++    fallback_b = MagicMock(spec=Provider)
++    fallback_b.provider_config = {"id": "fallback-b"}
++
++    def _get_provider_by_id(provider_id: str):
++        mapping = {
++            "main-provider": provider,
++            "fallback-a": fallback_a,
++            "fallback-b": fallback_b,
++            "missing": None,
++        }
++        return mapping.get(provider_id)
++
++    plugin_context = SimpleNamespace(get_provider_by_id=_get_provider_by_id)
++
++    with patch("astrbot.core.provider.fallback.logger") as mock_logger:
++        result = get_fallback_chat_providers(
++            provider,
++            plugin_context,
++            {
++                "fallback_chat_models": [
++                    "main-provider",
++                    "fallback-a",
++                    "missing",
++                    "fallback-b",
++                    "fallback-a",
++                    123,
++                    "",
++                ]
++            },
++        )
++
++    assert result == [fallback_a, fallback_b]
++    mock_logger.warning.assert_called_once_with(
++        "Fallback chat provider `%s` not found, skip.",
++        "missing",
++    )
++
++
++def test_get_fallback_chat_providers_rejects_non_list_config():
++    provider = MagicMock(spec=Provider)
++    provider.provider_config = {"id": "main-provider"}
++    plugin_context = SimpleNamespace(get_provider_by_id=lambda _provider_id: None)
++
++    with patch("astrbot.core.provider.fallback.logger") as mock_logger:
++        result = get_fallback_chat_providers(
++            provider,
++            plugin_context,
++            {"fallback_chat_models": "not-a-list"},
++        )
++
++    assert result == []
++    mock_logger.warning.assert_called_once_with(
++        "fallback_chat_models setting is not a list, skip fallback providers."
++    )
++
++
++def test_get_fallback_chat_providers_rejects_missing_provider_settings():
++    provider = MagicMock(spec=Provider)
++    provider.provider_config = {"id": "main-provider"}
++    plugin_context = SimpleNamespace(get_provider_by_id=lambda _provider_id: None)
++
++    with patch("astrbot.core.provider.fallback.logger") as mock_logger:
++        result = get_fallback_chat_providers(provider, plugin_context, None)
++
++    assert result == []
++    mock_logger.warning.assert_called_once_with(
++        "provider_settings is not a dict, skip fallback providers."
++    )
+diff --git a/tests/unit/test_subagent_orchestrator.py b/tests/unit/test_subagent_orchestrator.py
+index 9befac8872fad6ec726adf1d0cee85db4843a789..ccc8adb637e26410971dfc7eed937c1c0558aa2c 100644
+--- a/tests/unit/test_subagent_orchestrator.py
++++ b/tests/unit/test_subagent_orchestrator.py
+@@ -108,3 +108,20 @@ async def test_reload_from_config_tool_normalization(raw_tools, expected_tools):
+ 
+     handoff = orchestrator.handoffs[0]
+     assert handoff.agent.tools == expected_tools
++
++
++@pytest.mark.asyncio
++async def test_reload_from_config_missing_persona_tools_is_empty():
++    tool_mgr = MagicMock()
++    persona_mgr = MagicMock()
++    persona_mgr.get_persona_v3_by_id.return_value = {
++        "name": "custom",
++        "prompt": "persona prompt",
++        "_begin_dialogs_processed": [],
++    }
++    orchestrator = SubAgentOrchestrator(tool_mgr=tool_mgr, persona_mgr=persona_mgr)
++
++    await orchestrator.reload_from_config(_build_cfg({"persona_id": "custom"}))
++
++    handoff = orchestrator.handoffs[0]
++    assert handoff.agent.tools == []
+diff --git a/tests/unit/test_telegram_inline_query.py b/tests/unit/test_telegram_inline_query.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..038400f44b6d3663cc2d844eb342806335dd0b38
+--- /dev/null
++++ b/tests/unit/test_telegram_inline_query.py
+@@ -0,0 +1,461 @@
++import asyncio
++from types import SimpleNamespace
++from unittest.mock import AsyncMock, MagicMock, patch
++
++import pytest
++
++from astrbot.api.event import MessageChain
++from astrbot.api.message_components import Image
++from astrbot.api.platform import MessageType, PlatformMetadata
++from astrbot.core.event_bus import EventBus
++from astrbot.core.pipeline.waking_check.stage import WakingCheckStage
++from astrbot.core.platform.sources.telegram.inline_registry import (
++    telegram_inline_result_registry,
++)
++from astrbot.core.platform.sources.telegram.tg_event import (
++    TelegramChosenInlineResultEvent,
++)
++from astrbot.core.star.filter.command import CommandFilter
++from astrbot.core.star.star import StarMetadata, star_map
++from astrbot.core.star.star_handler import EventType, StarHandlerMetadata
++
++
++async def _handler(event):
++    yield event.plain_result("ok")
++
++
++def _make_handler(module_path: str, name: str) -> StarHandlerMetadata:
++    return StarHandlerMetadata(
++        event_type=EventType.InlineQueryEvent,
++        handler_full_name=f"{module_path}_{name}",
++        handler_name=name,
++        handler_module_path=module_path,
++        handler=_handler,
++        event_filters=[],
++    )
++
++
++async def _command_handler(self, event, value: str = ""):
++    yield event.plain_result(value)
++
++
++def _make_command_handler(
++    module_path: str,
++    name: str,
++    command_name: str,
++) -> StarHandlerMetadata:
++    handler = StarHandlerMetadata(
++        event_type=EventType.AdapterMessageEvent,
++        handler_full_name=f"{module_path}_{name}",
++        handler_name=name,
++        handler_module_path=module_path,
++        handler=_command_handler,
++        event_filters=[],
++    )
++    command_filter = CommandFilter(command_name, handler_md=handler)
++    handler.event_filters = [command_filter]
++    return handler
++
++
++class DummyInlineEvent:
++    def __init__(self, query="hello"):
++        self.inline_query_id = "iq-1"
++        self.query = query
++        self.message_str = query
++        self.unified_msg_origin = "telegram:other:user1"
++        self.plugins_name = None
++        self.is_wake = False
++        self.is_at_or_wake_command = False
++        self._extras = {}
++        self.answer_inline_options = AsyncMock()
++
++    def get_message_str(self):
++        return self.message_str
++
++    def get_extra(self, key=None, default=None):
++        if key is None:
++            return self._extras
++        return self._extras.get(key, default)
++
++    def set_extra(self, key, value):
++        self._extras[key] = value
++
++
++@pytest.fixture(autouse=True)
++def clear_inline_registry():
++    telegram_inline_result_registry.clear()
++    yield
++    telegram_inline_result_registry.clear()
++
++
++@pytest.mark.asyncio
++async def test_inline_query_generates_only_llm_option_without_plugin_handlers():
++    config_mgr = MagicMock()
++    config_mgr.get_conf.return_value = {"plugin_set": ["*"]}
++    bus = EventBus(asyncio.Queue(), {}, config_mgr)
++    event = DummyInlineEvent()
++
++    with (
++        patch(
++            "astrbot.core.event_bus.star_handlers_registry.get_handlers_by_event_type",
++            return_value=[],
++        ),
++        patch(
++            "astrbot.core.event_bus.SessionPluginManager.filter_handlers_by_session",
++            AsyncMock(side_effect=lambda _event, handlers: handlers),
++        ),
++    ):
++        handled = await bus._maybe_handle_inline_query(event)
++
++    assert handled is True
++    event.answer_inline_options.assert_awaited_once()
++    options = event.answer_inline_options.await_args.args[0]
++    assert [option["kind"] for option in options] == ["llm"]
++    assert options[0]["title"] == "LLM"
++    assert telegram_inline_result_registry.resolve(options[0]["id"]).kind == "llm"
++
++
++@pytest.mark.asyncio
++async def test_inline_query_generates_one_option_per_plugin_module(monkeypatch):
++    config_mgr = MagicMock()
++    config_mgr.get_conf.return_value = {"plugin_set": ["plugin-one"]}
++    bus = EventBus(asyncio.Queue(), {}, config_mgr)
++    event = DummyInlineEvent("lookup")
++    h1 = _make_handler("plugins.one", "first")
++    h2 = _make_handler("plugins.one", "second")
++    h3 = _make_handler("plugins.two", "first")
++
++    monkeypatch.setitem(
++        star_map,
++        "plugins.one",
++        StarMetadata(name="plugin-one", display_name="Plugin One", desc="First plugin"),
++    )
++    monkeypatch.setitem(
++        star_map,
++        "plugins.two",
++        StarMetadata(
++            name="plugin-two", display_name="Plugin Two", desc="Second plugin"
++        ),
++    )
++
++    with (
++        patch(
++            "astrbot.core.event_bus.star_handlers_registry.get_handlers_by_event_type",
++            return_value=[h1, h2, h3],
++        ) as get_handlers,
++        patch(
++            "astrbot.core.event_bus.SessionPluginManager.filter_handlers_by_session",
++            AsyncMock(return_value=[h1, h2]),
++        ),
++    ):
++        handled = await bus._maybe_handle_inline_query(event)
++
++    assert handled is True
++    get_handlers.assert_any_call(
++        EventType.InlineQueryEvent,
++        plugins_name=["plugin-one"],
++    )
++    options = event.answer_inline_options.await_args.args[0]
++    assert [option["title"] for option in options] == ["LLM", "Plugin One"]
++    target = telegram_inline_result_registry.resolve(options[1]["id"])
++    assert target.kind == "plugin"
++    assert target.plugin_module_path == "plugins.one"
++    assert target.handlers == [h1, h2]
++
++
++@pytest.mark.asyncio
++async def test_inline_query_command_mode_only_lists_matching_command_plugin(
++    monkeypatch,
++):
++    config_mgr = MagicMock()
++    config_mgr.get_conf.return_value = {
++        "plugin_set": ["*"],
++        "wake_prefix": ["/"],
++    }
++    bus = EventBus(asyncio.Queue(), {}, config_mgr)
++    event = DummyInlineEvent("/asmr RJ123456")
++    inline_handler = _make_handler("plugins.inline", "inline")
++    asmr_handler = _make_command_handler("plugins.asmr", "asmr", "asmr")
++    other_handler = _make_command_handler("plugins.other", "other", "other")
++
++    monkeypatch.setitem(
++        star_map,
++        "plugins.asmr",
++        StarMetadata(name="asmr", display_name="ASMR", desc="Download ASMR"),
++    )
++    monkeypatch.setitem(
++        star_map,
++        "plugins.other",
++        StarMetadata(name="other", display_name="Other", desc="Other command"),
++    )
++
++    def get_handlers(event_type, plugins_name=None):
++        if event_type == EventType.InlineQueryEvent:
++            return [inline_handler]
++        if event_type == EventType.AdapterMessageEvent:
++            return [asmr_handler, other_handler]
++        return []
++
++    with (
++        patch(
++            "astrbot.core.event_bus.star_handlers_registry.get_handlers_by_event_type",
++            side_effect=get_handlers,
++        ),
++        patch(
++            "astrbot.core.event_bus.SessionPluginManager.filter_handlers_by_session",
++            AsyncMock(side_effect=lambda _event, handlers: handlers),
++        ),
++    ):
++        handled = await bus._maybe_handle_inline_query(event)
++
++    assert handled is True
++    options = event.answer_inline_options.await_args.args[0]
++    assert [option["title"] for option in options] == ["ASMR"]
++    target = telegram_inline_result_registry.resolve(options[0]["id"])
++    assert target.kind == "plugin"
++    assert target.query == "/asmr RJ123456"
++    assert target.use_command_flow is True
++    assert target.handlers == [asmr_handler]
++
++
++class DummyChosenEvent:
++    def __init__(self, result_id: str, query: str = "hello"):
++        self.result_id = result_id
++        self.inline_message_id = "inline-1"
++        self.query = query
++        self.message_str = query
++        self.message_obj = SimpleNamespace(type=MessageType.OTHER_MESSAGE)
++        self._extras = {}
++        self.plugins_name = None
++        self.call_llm = False
++        self.is_wake = False
++        self.is_at_or_wake_command = False
++        self.role = "member"
++
++    @property
++    def unified_msg_origin(self):
++        return "telegram:other:user1"
++
++    def set_extra(self, key, value):
++        self._extras[key] = value
++
++    def get_extra(self, key=None, default=None):
++        if key is None:
++            return self._extras
++        return self._extras.get(key, default)
++
++    def get_sender_id(self):
++        return "user1"
++
++    def get_message_str(self):
++        return self.message_str
++
++    def get_self_id(self):
++        return "bot1"
++
++    def stop_event(self):
++        self.stopped = True
++
++    def get_messages(self):
++        return []
++
++    def is_private_chat(self):
++        return True
++
++
++async def _build_waking_stage():
++    stage = WakingCheckStage()
++    ctx = MagicMock()
++    ctx.astrbot_config = {
++        "admins_id": [],
++        "wake_prefix": ["/"],
++        "plugin_set": ["*"],
++        "platform_settings": {
++            "no_permission_reply": False,
++            "friend_message_needs_wake_prefix": False,
++            "ignore_bot_self_message": False,
++            "ignore_at_all": False,
++            "unique_session": False,
++        },
++        "disable_builtin_commands": False,
++    }
++    await stage.initialize(ctx)
++    return stage
++
++
++@pytest.mark.asyncio
++async def test_chosen_inline_llm_route_activates_only_llm():
++    result_id = telegram_inline_result_registry.register(
++        inline_query_id="iq-1",
++        kind="llm",
++        query="explain",
++        ordinal=0,
++    )
++    event = DummyChosenEvent(result_id, "old")
++    stage = await _build_waking_stage()
++
++    await stage.process(event)
++
++    assert event.message_str == "explain"
++    assert event.is_wake is True
++    assert event.is_at_or_wake_command is True
++    assert event.call_llm is False
++    assert event.get_extra("activated_handlers") == []
++
++
++@pytest.mark.asyncio
++async def test_chosen_inline_plugin_route_activates_only_registered_handlers():
++    handler = _make_handler("plugins.one", "first")
++    result_id = telegram_inline_result_registry.register(
++        inline_query_id="iq-1",
++        kind="plugin",
++        query="lookup",
++        ordinal=1,
++        handlers=[handler],
++        plugin_module_path="plugins.one",
++        plugin_name="Plugin One",
++    )
++    event = DummyChosenEvent(result_id, "old")
++    stage = await _build_waking_stage()
++
++    with patch(
++        "astrbot.core.pipeline.waking_check.stage.SessionPluginManager.filter_handlers_by_session",
++        AsyncMock(return_value=[handler]),
++    ):
++        await stage.process(event)
++
++    assert event.message_str == "lookup"
++    assert event.call_llm is True
++    assert event.get_extra("activated_handlers") == [handler]
++    assert event.get_extra("handlers_parsed_params") == {}
++
++
++@pytest.mark.asyncio
++async def test_chosen_inline_command_route_uses_normal_command_pipeline():
++    handler = _make_command_handler("plugins.asmr", "asmr", "asmr")
++    result_id = telegram_inline_result_registry.register(
++        inline_query_id="iq-1",
++        kind="plugin",
++        query="/asmr RJ123456",
++        ordinal=1,
++        handlers=[handler],
++        plugin_module_path="plugins.asmr",
++        plugin_name="ASMR",
++        use_command_flow=True,
++    )
++    event = DummyChosenEvent(result_id, "old")
++    stage = await _build_waking_stage()
++
++    with (
++        patch(
++            "astrbot.core.pipeline.waking_check.stage.star_handlers_registry.get_handlers_by_event_type",
++            side_effect=lambda event_type, plugins_name=None: (
++                [handler] if event_type == EventType.AdapterMessageEvent else []
++            ),
++        ),
++        patch(
++            "astrbot.core.pipeline.waking_check.stage.SessionPluginManager.filter_handlers_by_session",
++            AsyncMock(side_effect=lambda _event, handlers: handlers),
++        ),
++    ):
++        await stage.process(event)
++
++    assert event.message_str == "asmr RJ123456"
++    assert event.get_extra("wake_prefix") == "/"
++    assert event.get_extra("activated_handlers") == [handler]
++    assert event.get_extra("handlers_parsed_params") == {
++        handler.handler_full_name: {"value": "RJ123456"}
++    }
++
++
++@pytest.mark.asyncio
++async def test_chosen_inline_unknown_result_preserves_legacy_chosen_handlers():
++    chosen_handler = _make_handler("plugins.chosen", "chosen")
++    chosen_handler.event_type = EventType.ChosenInlineResultEvent
++    event = DummyChosenEvent("missing-result", "legacy")
++    stage = await _build_waking_stage()
++
++    with (
++        patch(
++            "astrbot.core.pipeline.waking_check.stage.star_handlers_registry.get_handlers_by_event_type",
++            side_effect=lambda event_type, plugins_name=None: (
++                [chosen_handler]
++                if event_type == EventType.ChosenInlineResultEvent
++                else []
++            ),
++        ),
++        patch(
++            "astrbot.core.pipeline.waking_check.stage.SessionPluginManager.filter_handlers_by_session",
++            AsyncMock(side_effect=lambda _event, handlers: handlers),
++        ),
++    ):
++        await stage.process(event)
++
++    assert event.get_extra("activated_handlers") == [chosen_handler]
++
++
++def _make_chosen_event(client):
++    return TelegramChosenInlineResultEvent(
++        result_id="result-1",
++        from_user_id="user1",
++        from_username="alice",
++        query="query",
++        inline_message_id="inline-1",
++        platform_meta=PlatformMetadata("telegram", "telegram", "telegram"),
++        session_id="user1",
++        client=client,
++    )
++
++
++@pytest.mark.asyncio
++async def test_chosen_inline_text_only_edits_text():
++    client = MagicMock()
++    client.edit_message_text = AsyncMock()
++    client.edit_message_media = AsyncMock()
++    event = _make_chosen_event(client)
++
++    await event.send_with_client(client, MessageChain().message("plain reply"), "user1")
++
++    client.edit_message_text.assert_awaited_once()
++    client.edit_message_media.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++async def test_chosen_inline_url_image_with_text_edits_photo_caption():
++    client = MagicMock()
++    client.edit_message_text = AsyncMock()
++    client.edit_message_media = AsyncMock()
++    event = _make_chosen_event(client)
++    chain = MessageChain().message("caption text")
++    chain.chain.append(Image.fromURL("https://example.com/a.jpg"))
++
++    await event.send_with_client(client, chain, "user1")
++
++    client.edit_message_media.assert_awaited_once()
++    kwargs = client.edit_message_media.await_args.kwargs
++    assert kwargs["inline_message_id"] == "inline-1"
++    assert kwargs["media"].media == "https://example.com/a.jpg"
++    assert kwargs["media"].caption == "caption text"
++    client.edit_message_text.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++async def test_chosen_inline_unpublishable_local_image_falls_back_to_text(tmp_path):
++    client = MagicMock()
++    client.edit_message_text = AsyncMock()
++    client.edit_message_media = AsyncMock()
++    event = _make_chosen_event(client)
++    image_path = tmp_path / "a.jpg"
++    image_path.write_bytes(b"fake")
++    chain = MessageChain().message("fallback text")
++    chain.chain.append(Image.fromFileSystem(str(image_path)))
++
++    with patch.object(
++        Image,
++        "register_to_file_service",
++        AsyncMock(side_effect=Exception("no file service")),
++    ):
++        await event.send_with_client(client, chain, "user1")
++
++    client.edit_message_media.assert_not_awaited()
++    client.edit_message_text.assert_awaited_once()
