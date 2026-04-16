@@ -46,7 +46,7 @@ class ExecuteShellTool(FunctionTool):
                 },
             },
             "required": ["command"],
-        }
+        },
     )
 
     async def call(

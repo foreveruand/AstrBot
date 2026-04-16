@@ -763,6 +763,7 @@ class TelegramPlatformAdapter(Platform):
         inline_query_event = TelegramInlineQueryEvent(
             query=update.inline_query.query,
             from_user_id=str(update.inline_query.from_user.id),
+            from_username=update.inline_query.from_user.username,
             inline_query_id=update.inline_query.id,
             offset=update.inline_query.offset,
             platform_meta=self.meta(),
@@ -783,6 +784,7 @@ class TelegramPlatformAdapter(Platform):
         chosen_result_event = TelegramChosenInlineResultEvent(
             result_id=update.chosen_inline_result.result_id,
             from_user_id=str(update.chosen_inline_result.from_user.id),
+            from_username=update.chosen_inline_result.from_user.username,
             query=update.chosen_inline_result.query,
             inline_message_id=getattr(
                 update.chosen_inline_result, "inline_message_id", None
@@ -806,6 +808,7 @@ class TelegramPlatformAdapter(Platform):
             callback_query_id=update.callback_query.id,
             data=update.callback_query.data or "",
             from_user_id=str(update.callback_query.from_user.id),
+            from_username=update.callback_query.from_user.username,
             message=update.callback_query.message,
             inline_message_id=getattr(update.callback_query, "inline_message_id", None),
             platform_meta=self.meta(),

@@ -4,7 +4,6 @@ import json
 import logging
 import random
 import uuid
-import time
 from collections.abc import AsyncGenerator
 from pathlib import Path
 from typing import Literal, cast
@@ -17,7 +16,6 @@ from google.genai.errors import APIError
 import astrbot.core.message.components as Comp
 from astrbot import logger
 from astrbot.api.provider import Provider
-from astrbot.core.exceptions import EmptyModelOutputError
 from astrbot.core.agent.message import (
     AudioURLPart,
     ContentPart,

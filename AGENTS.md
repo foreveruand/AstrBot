@@ -28,6 +28,15 @@ Runs on `http://localhost:3000` by default.
 5. Use English for all new comments.
 6. For path handling, use `pathlib.Path` instead of string paths, and use `astrbot.core.utils.path_utils` to get the AstrBot data and temp directory.
 
+## Plugin development requirements
+
+1. **Repository scope**: Plugin code changes must NOT be committed to the AstrBot root repository. Only commit changes within the plugin's own directory/repository.
+2. **Documentation updates**: When implementing feature improvements or bug fixes, you MUST update the following files in the plugin directory:
+   - `CHANGELOG.md` - Document the changes
+   - `README.md` - Update usage instructions if affected
+   - `metadata.yaml` - Update the version number
+   - `_conf_schema.json` or configuration files - Update if configuration options changed
+
 ## PR instructions
 
 1. Title format: use conventional commit messages

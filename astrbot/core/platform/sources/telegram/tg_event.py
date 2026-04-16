@@ -11,6 +11,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InlineQueryResultArticle,
+    InputMediaPhoto,
     InputTextMessageContent,
     ReactionTypeCustomEmoji,
     ReactionTypeEmoji,
@@ -31,6 +32,7 @@ from astrbot.api.message_components import (
     Video,
 )
 from astrbot.api.platform import AstrBotMessage, MessageType, PlatformMetadata
+from astrbot.core.platform.astrbot_message import MessageMember
 from astrbot.core.utils.metrics import Metric
 
 
@@ -47,6 +49,8 @@ def _is_gif(path: str) -> bool:
 class TelegramPlatformEvent(AstrMessageEvent):
     # Telegram 的最大消息长度限制
     MAX_MESSAGE_LENGTH = 4096
+    MAX_CAPTION_LENGTH = 1024
+    MAX_MEDIA_GROUP_SIZE = 10
 
     SPLIT_PATTERNS = {
         "paragraph": re.compile(r"\n\n"),
@@ -90,18 +94,19 @@ class TelegramPlatformEvent(AstrMessageEvent):
         self.client = client
 
     @classmethod
-    def _split_message(cls, text: str) -> list[str]:
-        if len(text) <= cls.MAX_MESSAGE_LENGTH:
+    def _split_message(cls, text: str, max_length: int | None = None) -> list[str]:
+        limit = max_length or cls.MAX_MESSAGE_LENGTH
+        if len(text) <= limit:
             return [text]
 
         chunks = []
         while text:
-            if len(text) <= cls.MAX_MESSAGE_LENGTH:
+            if len(text) <= limit:
                 chunks.append(text)
                 break
 
-            split_point = cls.MAX_MESSAGE_LENGTH
-            segment = text[: cls.MAX_MESSAGE_LENGTH]
+            split_point = limit
+            segment = text[:limit]
 
             for _, pattern in cls.SPLIT_PATTERNS.items():
                 if matches := list(pattern.finditer(segment)):
@@ -115,6 +120,19 @@ class TelegramPlatformEvent(AstrMessageEvent):
         return chunks
 
     @classmethod
+    def _split_caption_text(cls, text: str | None) -> tuple[str | None, str | None]:
+        if not text:
+            return None, None
+
+        caption = text[: cls.MAX_CAPTION_LENGTH]
+        remaining_text = (
+            text[cls.MAX_CAPTION_LENGTH :]
+            if len(text) > cls.MAX_CAPTION_LENGTH
+            else None
+        )
+        return caption, remaining_text
+
+    @classmethod
     async def _send_text_chunks(
         cls,
         client: ExtBot,
@@ -122,7 +140,7 @@ class TelegramPlatformEvent(AstrMessageEvent):
         payload: dict[str, Any],
     ) -> None:
         """按 Telegram 限制切分文本后逐段发送。"""
-        for chunk in cls._split_message(text):
+        for chunk in cls._split_message(text, cls.MAX_MESSAGE_LENGTH):
             try:
                 markdown_text = telegramify_markdown.markdownify(
                     chunk,
@@ -351,61 +369,136 @@ class TelegramPlatformEvent(AstrMessageEvent):
             return payload
 
         if images:
-            first_image = images[0]
-            image_path = await first_image.convert_to_file_path()
-            payload = get_base_payload()
-            if full_text:
-                # Telegram caption 限制 1024 字符
-                caption = full_text[:1024] if len(full_text) > 1024 else full_text
+            image_infos: list[tuple[str, bool, bool]] = []
+            for img in images:
+                image_path = await img.convert_to_file_path()
+                image_infos.append((image_path, img.use_spoiler, _is_gif(image_path)))
+
+            first_caption, remaining_text = cls._split_caption_text(full_text)
+            caption_text: str | None = None
+            caption_parse_mode: str | None = None
+            if first_caption:
                 try:
-                    caption = telegramify_markdown.markdownify(caption)
-                    payload["parse_mode"] = "MarkdownV2"
+                    caption_text = telegramify_markdown.markdownify(first_caption)
+                    caption_parse_mode = "MarkdownV2"
                 except Exception as e:
                     logger.warning(f"Caption markdownify failed: {e}, using plain text")
-                if _is_gif(image_path):
-                    await client.send_animation(
-                        animation=image_path,
-                        caption=caption,
-                        **cast(Any, payload),
-                    )
+                    caption_text = first_caption
+
+            caption_sent = False
+
+            def _caption_for_next_media() -> tuple[str | None, str | None]:
+                nonlocal caption_sent
+                if caption_sent or not caption_text:
+                    return None, None
+                caption_sent = True
+                return caption_text, caption_parse_mode
+
+            async def _send_photo_batch(batch: list[tuple[str, bool, bool]]) -> None:
+                if not batch:
+                    return
+
+                if len(batch) >= 2:
+                    for batch_start in range(0, len(batch), cls.MAX_MEDIA_GROUP_SIZE):
+                        group = batch[
+                            batch_start : batch_start + cls.MAX_MEDIA_GROUP_SIZE
+                        ]
+                        payload = get_base_payload()
+                        media: list[InputMediaPhoto] = []
+                        group_caption: str | None = None
+                        group_parse_mode: str | None = None
+                        if batch_start == 0:
+                            group_caption, group_parse_mode = _caption_for_next_media()
+
+                        for idx, (img_path, use_spoiler, _) in enumerate(group):
+                            photo_kwargs: dict[str, Any] = {
+                                "media": img_path,
+                                "has_spoiler": use_spoiler,
+                            }
+                            if idx == 0 and group_caption:
+                                photo_kwargs["caption"] = group_caption
+                                if group_parse_mode:
+                                    photo_kwargs["parse_mode"] = group_parse_mode
+                            media.append(InputMediaPhoto(**photo_kwargs))
+
+                        try:
+                            await client.send_media_group(
+                                media=media,
+                                **cast(Any, payload),
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                f"send_media_group failed, fallback to single photos: {e}"
+                            )
+                            for idx, (img_path, use_spoiler, _) in enumerate(group):
+                                photo_payload = get_base_payload()
+                                photo_kwargs: dict[str, Any] = {
+                                    "photo": img_path,
+                                    "has_spoiler": use_spoiler,
+                                }
+                                if idx == 0 and group_caption:
+                                    photo_kwargs["caption"] = group_caption
+                                    if group_parse_mode:
+                                        photo_payload["parse_mode"] = group_parse_mode
+                                await client.send_photo(
+                                    **photo_kwargs,
+                                    **cast(Any, photo_payload),
+                                )
                 else:
-                    await client.send_photo(
-                        photo=image_path,
-                        caption=caption,
-                        has_spoiler=first_image.use_spoiler,
+                    only_path, only_spoiler, _ = batch[0]
+                    payload = get_base_payload()
+                    photo_kwargs: dict[str, Any] = {
+                        "photo": only_path,
+                        "has_spoiler": only_spoiler,
+                    }
+                    single_caption, single_parse_mode = _caption_for_next_media()
+                    if single_caption:
+                        photo_kwargs["caption"] = single_caption
+                        if single_parse_mode:
+                            payload["parse_mode"] = single_parse_mode
+                    await client.send_photo(**photo_kwargs, **cast(Any, payload))
+
+            pending_photos: list[tuple[str, bool, bool]] = []
+            has_gif = any(is_gif for _, _, is_gif in image_infos)
+
+            if len(image_infos) >= 2 and has_gif:
+                pending_photos = [info for info in image_infos if not info[2]]
+                await _send_photo_batch(pending_photos)
+                for image_path, _, _ in [info for info in image_infos if info[2]]:
+                    payload = get_base_payload()
+                    animation_kwargs: dict[str, Any] = {"animation": image_path}
+                    gif_caption, gif_parse_mode = _caption_for_next_media()
+                    if gif_caption:
+                        animation_kwargs["caption"] = gif_caption
+                        if gif_parse_mode:
+                            payload["parse_mode"] = gif_parse_mode
+                    await client.send_animation(
+                        **animation_kwargs,
                         **cast(Any, payload),
                     )
+            elif len(image_infos) >= 2:
+                await _send_photo_batch(image_infos)
             else:
-                if _is_gif(image_path):
-                    await client.send_animation(
-                        animation=image_path,
-                        **cast(Any, payload),
-                    )
-                else:
-                    await client.send_photo(
-                        photo=image_path,
-                        has_spoiler=first_image.use_spoiler,
-                        **cast(Any, payload),
-                    )
-
-            for img in images[1:]:
-                image_path = await img.convert_to_file_path()
+                first_image_path, first_spoiler, first_is_gif = image_infos[0]
                 payload = get_base_payload()
-                if _is_gif(image_path):
-                    await client.send_animation(
-                        animation=image_path,
-                        **cast(Any, payload),
-                    )
-                else:
-                    await client.send_photo(
-                        photo=image_path,
-                        has_spoiler=img.use_spoiler,
-                        **cast(Any, payload),
-                    )
 
-            if full_text and len(full_text) > 1024:
-                remaining_text = full_text[1024:]
-                chunks = cls._split_message(remaining_text)
+                if first_is_gif:
+                    animation_kwargs: dict[str, Any] = {"animation": first_image_path}
+                    gif_caption, gif_parse_mode = _caption_for_next_media()
+                    if gif_caption:
+                        animation_kwargs["caption"] = gif_caption
+                        if gif_parse_mode:
+                            payload["parse_mode"] = gif_parse_mode
+                    await client.send_animation(
+                        **animation_kwargs,
+                        **cast(Any, payload),
+                    )
+                    remaining_text = full_text if not caption_sent else remaining_text
+                else:
+                    await _send_photo_batch([(first_image_path, first_spoiler, False)])
+
+            if remaining_text:
+                chunks = cls._split_message(remaining_text, cls.MAX_MESSAGE_LENGTH)
                 for chunk in chunks:
                     payload = get_base_payload()
                     payload["disable_web_page_preview"] = True
@@ -564,6 +657,7 @@ class TelegramPlatformEvent(AstrMessageEvent):
             text: 消息文本，1-4096 字符
             message_thread_id: 可选，目标消息线程 ID
             parse_mode: 可选，消息文本的解析模式
+
         """
         if not text or not text.strip():
             return
@@ -573,6 +667,10 @@ class TelegramPlatformEvent(AstrMessageEvent):
             kwargs["message_thread_id"] = int(message_thread_id)
         if parse_mode:
             kwargs["parse_mode"] = parse_mode
+
+        if not text or not text.strip():
+            logger.debug("[Telegram] sendMessageDraft skipped: text is empty.")
+            return
 
         try:
             logger.debug(
@@ -913,6 +1011,7 @@ class TelegramInlineQueryEvent(AstrMessageEvent):
         self,
         query: str,
         from_user_id: str,
+        from_username: str | None,
         inline_query_id: str,
         offset: str,
         platform_meta: PlatformMetadata,
@@ -923,6 +1022,8 @@ class TelegramInlineQueryEvent(AstrMessageEvent):
         """内联查询的文本"""
         self.from_user_id = from_user_id
         """发起查询的用户ID"""
+        self.from_username = from_username
+        """发起查询的用户名"""
         self.inline_query_id = inline_query_id
         """内联查询的唯一ID"""
         self.offset = offset
@@ -937,7 +1038,8 @@ class TelegramInlineQueryEvent(AstrMessageEvent):
         message_obj = AstrBotMessage()
         message_obj.message = [Plain(query)] if query else []
         message_obj.type = MessageType.OTHER_MESSAGE  # 内联查询视为系统消息
-        message_obj.sender = from_user_id
+        nickname = from_username or from_user_id
+        message_obj.sender = MessageMember(user_id=from_user_id, nickname=nickname)
 
         super().__init__(
             message_str=query,
@@ -950,7 +1052,7 @@ class TelegramInlineQueryEvent(AstrMessageEvent):
         return self.from_user_id
 
     def get_sender_name(self) -> str:
-        return self.from_user_id  # Telegram 用户名可能不可用
+        return self.from_username or self.from_user_id
 
     def get_message_type(self) -> MessageType:
         return MessageType.OTHER_MESSAGE
@@ -1099,6 +1201,7 @@ class TelegramChosenInlineResultEvent(AstrMessageEvent):
         self,
         result_id: str,
         from_user_id: str,
+        from_username: str | None,
         query: str,
         inline_message_id: str | None,
         platform_meta: PlatformMetadata,
@@ -1109,6 +1212,8 @@ class TelegramChosenInlineResultEvent(AstrMessageEvent):
         """被选择的结果ID"""
         self.from_user_id = from_user_id
         """选择结果的用户ID"""
+        self.from_username = from_username
+        """选择结果的用户名"""
         self.query = query
         """原始查询文本"""
         self.inline_message_id = inline_message_id
@@ -1121,7 +1226,8 @@ class TelegramChosenInlineResultEvent(AstrMessageEvent):
         message_obj = AstrBotMessage()
         message_obj.message = [Plain(query)] if query else []
         message_obj.type = MessageType.OTHER_MESSAGE  # 选择结果视为系统消息
-        message_obj.sender = from_user_id
+        nickname = from_username or from_user_id
+        message_obj.sender = MessageMember(user_id=from_user_id, nickname=nickname)
 
         super().__init__(
             message_str=query,
@@ -1134,7 +1240,7 @@ class TelegramChosenInlineResultEvent(AstrMessageEvent):
         return self.from_user_id
 
     def get_sender_name(self) -> str:
-        return self.from_user_id  # Telegram 用户名可能不可用
+        return self.from_username or self.from_user_id
 
     def get_message_type(self) -> MessageType:
         return MessageType.OTHER_MESSAGE
@@ -1143,23 +1249,333 @@ class TelegramChosenInlineResultEvent(AstrMessageEvent):
         text = message_chain.get_plain_text(with_other_comps_mark=True)
         return text.strip()
 
+    @staticmethod
+    def _strip_markdown(text: str) -> str:
+        """Strip markdown formatting from text, keeping only plain content.
+
+        Removes all markdown syntax (bold, italic, code blocks, headers, etc.)
+        from LLM responses before wrapping them in blockquotes. This prevents
+        nested markdown from producing malformed MarkdownV2 entities (e.g. unclosed
+        spoiler/expandable-blockquote ``||...||``) when telegramify_markdown converts
+        the ``>``-prefixed blockquote structure.
+        """
+        # Fenced code blocks: keep inner content, drop fence markers
+        text = re.sub(
+            r"```[^\n]*\n(.*?)```",
+            lambda m: m.group(1),
+            text,
+            flags=re.DOTALL,
+        )
+        # Inline code
+        text = re.sub(r"`([^`\n]+)`", r"\1", text)
+        # ATX headers
+        text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
+        # Bold + italic (*** or ___)
+        text = re.sub(r"\*{3}(.+?)\*{3}", r"\1", text, flags=re.DOTALL)
+        text = re.sub(r"_{3}(.+?)_{3}", r"\1", text, flags=re.DOTALL)
+        # Bold (** or __)
+        text = re.sub(r"\*{2}(.+?)\*{2}", r"\1", text, flags=re.DOTALL)
+        text = re.sub(r"_{2}(.+?)_{2}", r"\1", text, flags=re.DOTALL)
+        # Italic (* or _)
+        text = re.sub(r"\*(.+?)\*", r"\1", text, flags=re.DOTALL)
+        text = re.sub(r"_([^_\n]+?)_", r"\1", text)
+        # Spoiler entities
+        text = re.sub(r"\|\|(.+?)\|\|", r"\1", text, flags=re.DOTALL)
+        # Strikethrough
+        text = re.sub(r"~~(.+?)~~", r"\1", text, flags=re.DOTALL)
+        # Links — keep display text
+        text = re.sub(r"\[([^\]\n]+)\]\([^\)\n]*\)", r"\1", text)
+        # Horizontal rules
+        text = re.sub(r"^[ \t]*[-*_]{3,}[ \t]*$", "", text, flags=re.MULTILINE)
+        return text
+
+    @staticmethod
+    def _escape_mv2(text: str) -> str:
+        """Escape plain text for safe use inside Telegram MarkdownV2.
+
+        Backslash is escaped first to avoid double-escaping. The resulting
+        string can be embedded in any MarkdownV2 context (including blockquotes)
+        without producing invalid entities.
+        """
+        text = text.replace("\\", "\\\\")
+        return re.sub(r"([_*\[\]()~`>#+=|{}.!\-])", r"\\\1", text)
+
+    def _build_mv2_blockquote(self, llm_text: str, max_length: int = 3900) -> str:
+        """Build a ready-to-send Telegram MarkdownV2 string with blockquote wrapping.
+
+        Strips markdown from the LLM reply, escapes all special characters for
+        MarkdownV2, then prefixes every content line with ">" so the reply
+        always renders as a blockquote in the Telegram client regardless of
+        the original content. Truncates to *max_length* if needed.
+
+        Does not rely on telegramify_markdown, so it never produces malformed
+        entities (e.g. unclosed ``||`` spoiler/expandable-blockquote).
+        """
+        clean = self._strip_markdown(llm_text).strip()
+        all_lines: list[str] = []
+        if self.query:
+            escaped_query = self._escape_mv2(self.query.replace("\n", " ").strip())
+            all_lines.append(f">{escaped_query}")
+            all_lines.append("")
+            all_lines.append(self._escape_mv2("回答："))
+            all_lines.append("")
+        else:
+            all_lines.append(self._escape_mv2("回答："))
+            all_lines.append("")
+        for line in clean.split("\n"):
+            escaped = self._escape_mv2(line)
+            all_lines.append(f">{escaped}" if escaped else ">")
+        full = "\n".join(all_lines)
+        if len(full) <= max_length:
+            return full
+        truncation = "\n>…"
+        available = max_length - len(truncation)
+        if available <= 0:
+            return full[: max_length - 1] + "…"
+        cut_text = full[:available]
+        last_nl = cut_text.rfind("\n>")
+        if last_nl > available * 0.5:
+            cut_text = cut_text[:last_nl]
+        return cut_text.rstrip() + truncation
+
+    def _build_mv2_streaming(self, delta: str) -> str:
+        """Build a MarkdownV2 blockquote for intermediate streaming display.
+
+        Same structure as *_build_mv2_blockquote* but without length truncation,
+        since in-progress streaming text is always shorter than the final reply.
+        """
+        clean = self._strip_markdown(delta)
+        parts: list[str] = []
+        if self.query:
+            escaped_query = self._escape_mv2(self.query.replace("\n", " ").strip())
+            parts.append(f">{escaped_query}")
+            parts.append("")
+            parts.append(self._escape_mv2("回答："))
+            parts.append("")
+        else:
+            parts.append(self._escape_mv2("回答："))
+            parts.append("")
+        for line in clean.strip().split("\n"):
+            escaped = self._escape_mv2(line)
+            parts.append(f">{escaped}" if escaped else ">")
+        return "\n".join(parts)
+
+    def _format_inline_response(self, llm_text: str) -> str:
+        """Format LLM response with Telegram quote blocks.
+
+        Uses proper separators to prevent query and reply quote blocks
+        from being merged into one block by Telegram.
+
+        The reply blockquote will be converted to expandable_blockquote
+        by telegramify_markdown if length > 200 characters.
+
+        Args:
+            llm_text: The LLM response text to format.
+
+        Returns:
+            Formatted text with quote blocks.
+
+        """
+        # Strip markdown from LLM text before wrapping in blockquotes.
+        # Nested markdown inside ">" prefixes confuses telegramify_markdown,
+        # generating unclosed ||spoiler|| entities that Telegram rejects.
+        lines = self._strip_markdown(llm_text).strip().split("\n")
+        quoted_lines = []
+
+        if self.query:
+            # Query quote block (short, non-expandable)
+            quoted_lines.append(f"> {self.query}")
+            # Empty line separator to split quote blocks
+            quoted_lines.append("")
+            quoted_lines.append("回答：")
+            quoted_lines.append("")
+        else:
+            quoted_lines.append("回答：")
+            quoted_lines.append("")
+
+        # Reply blockquote (may become expandable if > 200 chars)
+        for line in lines:
+            quoted_lines.append(f"> {line}" if line else ">")
+
+        return "\n".join(quoted_lines)
+
+    def _truncate_for_telegram(self, text: str, max_length: int = 3800) -> str:
+        """Truncate text for Telegram message length limit.
+
+        Smart truncation that preserves user query part and truncates only
+        the LLM response at paragraph/line boundaries. Must be called before
+        markdownify to avoid breaking MarkdownV2 formatting.
+
+        Args:
+            text: Formatted inline response text (from _format_inline_response)
+            max_length: Maximum allowed length (default 3800 to reserve
+                       ~5-15% overhead for markdownify escaping)
+
+        Returns:
+            Truncated text if exceeded max_length, otherwise original text
+
+        """
+        if len(text) <= max_length:
+            return text
+
+        # Format: "> query\n\n回答：\n\n> reply..."
+        # Find the start of reply blockquote after "回答："
+        prefix_end_marker = "\n回答：\n\n>"
+        prefix_end_pos = text.find(prefix_end_marker)
+
+        truncation_indicator = "\n> …"
+
+        if prefix_end_pos != -1:
+            # Include the first ">" of reply blockquote in prefix
+            prefix = text[: prefix_end_pos + len("\n回答：\n\n")]
+            content = text[prefix_end_pos + len("\n回答：\n\n") :]
+            available = max_length - len(prefix) - len(truncation_indicator)
+
+            if available <= 0:
+                return (
+                    text[: max_length - len(truncation_indicator)]
+                    + truncation_indicator
+                )
+
+            truncated_content = content[:available]
+            # Try to truncate at paragraph boundary (empty quote line followed by quote)
+            last_para = truncated_content.rfind("\n>\n>")
+            if last_para > available * 0.7:
+                truncated_content = truncated_content[:last_para]
+            else:
+                # Try to truncate at line boundary
+                last_line = truncated_content.rfind("\n>")
+                if last_line > available * 0.5:
+                    truncated_content = truncated_content[:last_line]
+
+            return prefix + truncated_content.rstrip() + truncation_indicator
+
+        # Fallback: simple truncation
+        truncated = text[: max_length - len(truncation_indicator)]
+        last_line = truncated.rfind("\n")
+        if last_line > max_length * 0.5:
+            truncated = truncated[:last_line]
+
+        return truncated.rstrip() + truncation_indicator
+
+    @staticmethod
+    def _utf16_len(text: str) -> int:
+        """Return the length of *text* in UTF-16 code units.
+
+        Telegram measures entity ``offset`` and ``length`` in UTF-16 code
+        units, not Python ``len()`` characters.  Characters in the Basic
+        Multilingual Plane (U+0000–U+FFFF, including all CJK) count as 1;
+        characters outside the BMP (most emoji above U+FFFF) count as 2.
+        """
+        return len(text.encode("utf-16-le")) // 2
+
+    def _build_inline_entities(
+        self, reply_text: str, max_total: int = 4096
+    ) -> tuple[str, list]:
+        """Build plain text and ``MessageEntity`` list for a chosen-inline reply.
+
+        Produces the layout::
+
+            query          ← regular BLOCKQUOTE entity  (omitted when no query)
+
+            回答：
+
+            reply          ← EXPANDABLE_BLOCKQUOTE entity
+
+        Markdown is stripped from both query and reply before formatting so
+        that raw entity formatting is never needed, avoiding the
+        ``telegramify_markdown`` nested-entity pitfalls.
+
+        Args:
+            reply_text: Plugin or LLM reply (markdown will be stripped).
+            max_total: Maximum total character count (Telegram hard limit).
+
+        Returns:
+            ``(plain_text, entities)`` ready to pass to
+            ``edit_message_text(entities=…)``.
+
+        """
+        from telegram import MessageEntity
+
+        reply_clean = self._strip_markdown(reply_text).strip()
+
+        if self.query:
+            query_clean = self.query.replace("\n", " ").strip()
+            prefix = f"{query_clean}\n\n回答：\n\n"
+        else:
+            query_clean = None
+            prefix = "回答：\n\n"
+
+        # Truncate reply so the whole message fits within max_total characters.
+        available = max_total - len(prefix)
+        if available <= 0:
+            reply_clean = ""
+        elif len(reply_clean) > available:
+            reply_clean = reply_clean[: available - 1].rstrip() + "…"
+
+        full_text = prefix + reply_clean
+        entities: list[MessageEntity] = []
+
+        if query_clean:
+            entities.append(
+                MessageEntity(
+                    type=MessageEntity.BLOCKQUOTE,
+                    offset=0,
+                    length=self._utf16_len(query_clean),
+                )
+            )
+
+        if reply_clean:
+            entities.append(
+                MessageEntity(
+                    type=MessageEntity.EXPANDABLE_BLOCKQUOTE,
+                    offset=self._utf16_len(prefix),
+                    length=self._utf16_len(reply_clean),
+                )
+            )
+
+        return full_text, entities
+
     async def _edit_inline_message(
-        self, text: str, parse_mode: str | None = None, reply_markup=None
+        self,
+        text: str,
+        parse_mode: str | None = None,
+        reply_markup=None,
+        entities: list | None = None,
     ) -> None:
+        """Edit inline message, raising exception on failure for caller to handle.
+
+        When *entities* is provided it takes precedence over *parse_mode*,
+        allowing callers to use the native entity API (e.g. for
+        ``EXPANDABLE_BLOCKQUOTE``) instead of a markup parse mode.
+
+        Args:
+            text: Message text.
+            parse_mode: Parse mode (e.g. ``"MarkdownV2"``). Ignored when
+                *entities* is supplied.
+            reply_markup: Inline keyboard markup.
+            entities: Pre-built ``MessageEntity`` list.  When set,
+                ``parse_mode`` is not forwarded to the API.
+
+        Raises:
+            Exception: If edit fails, allowing caller to implement fallback.
+
+        """
         if not self.inline_message_id:
             logger.debug(
                 "TelegramChosenInlineResultEvent 缺少 inline_message_id，跳过编辑。"
             )
             return
-        try:
-            await self.client.edit_message_text(
-                text=text[: TelegramPlatformEvent.MAX_MESSAGE_LENGTH],
-                inline_message_id=self.inline_message_id,
-                parse_mode=parse_mode,
-                reply_markup=reply_markup,
-            )
-        except Exception as e:
-            logger.warning(f"编辑内联消息失败: {e!s}")
+        kwargs: dict = {
+            "text": text[: TelegramPlatformEvent.MAX_MESSAGE_LENGTH],
+            "inline_message_id": self.inline_message_id,
+            "reply_markup": reply_markup,
+        }
+        if entities is not None:
+            kwargs["entities"] = entities
+        else:
+            kwargs["parse_mode"] = parse_mode
+        await self.client.edit_message_text(**kwargs)
 
     async def send_with_client(
         self, client: ExtBot, message_chain: MessageChain, user_name: str
@@ -1186,20 +1602,60 @@ class TelegramChosenInlineResultEvent(AstrMessageEvent):
                     f"Failed to convert reply_markup to InlineKeyboardMarkup: {e}"
                 )
 
+        full_text, entities = self._build_inline_entities(text)
         try:
-            markdown_text = telegramify_markdown.markdownify(text)
             await self._edit_inline_message(
-                markdown_text,
-                parse_mode="MarkdownV2",
+                full_text,
                 reply_markup=reply_markup_keyboard,
+                entities=entities,
             )
         except Exception as e:
-            logger.warning(f"Markdown转换失败，使用普通文本: {e!s}")
-            await self._edit_inline_message(text, reply_markup=reply_markup_keyboard)
+            logger.warning(f"编辑内联消息失败: {e!s}")
 
     async def send(self, message: MessageChain) -> None:
         await self.send_with_client(self.client, message, self.get_sender_id())
         await super().send(message)
+
+    def _format_streaming_display(self, delta: str) -> str:
+        """Format text for streaming display with proper quote structure.
+
+        This method ensures consistent formatting during streaming edits,
+        matching the final format structure.
+
+        Args:
+            delta: Current accumulated text from streaming.
+
+        Returns:
+            Text formatted with quote blocks for display.
+
+        """
+        # Strip markdown for the same reason as _format_inline_response:
+        # incomplete markdown mid-stream is even more likely to create
+        # malformed MarkdownV2 entities inside the blockquote wrapper.
+        clean_delta = self._strip_markdown(delta)
+        if not self.query:
+            # No query, just format reply as blockquote
+            lines = clean_delta.strip().split("\n")
+            quoted_lines = ["回答：", ""]
+            for line in lines:
+                quoted_lines.append(f"> {line}" if line else ">")
+            return "\n".join(quoted_lines)
+
+        lines = clean_delta.strip().split("\n")
+        quoted_lines = []
+
+        # Query quote block (short, non-expandable)
+        quoted_lines.append(f"> {self.query}")
+        # Empty line separator to split quote blocks
+        quoted_lines.append("")
+        quoted_lines.append("回答：")
+        quoted_lines.append("")
+
+        # Reply blockquote (streaming content)
+        for line in lines:
+            quoted_lines.append(f"> {line}" if line else ">")
+
+        return "\n".join(quoted_lines)
 
     async def send_streaming(self, generator, use_fallback: bool = False):
         if not self.inline_message_id:
@@ -1239,24 +1695,27 @@ class TelegramChosenInlineResultEvent(AstrMessageEvent):
             delta += chain.get_plain_text(with_other_comps_mark=True)
             now = loop.time()
             if now - last_edit_time >= throttle_interval:
-                await self._edit_inline_message(delta)
+                display_text, display_entities = self._build_inline_entities(delta)
+                try:
+                    await self._edit_inline_message(
+                        display_text, entities=display_entities
+                    )
+                except Exception as e:
+                    logger.debug(f"Streaming edit failed: {e!s}")
                 current_content = delta
                 last_edit_time = now
 
         try:
             if delta and current_content != delta:
+                full_text, entities = self._build_inline_entities(delta)
                 try:
-                    markdown_text = telegramify_markdown.markdownify(delta)
                     await self._edit_inline_message(
-                        markdown_text,
-                        parse_mode="MarkdownV2",
+                        full_text,
+                        entities=entities,
                         reply_markup=reply_markup_keyboard,
                     )
                 except Exception as e:
-                    logger.warning(f"Markdown转换失败，使用普通文本: {e!s}")
-                    await self._edit_inline_message(
-                        delta, reply_markup=reply_markup_keyboard
-                    )
+                    logger.warning(f"最终编辑失败: {e!s}")
         except Exception as e:
             logger.warning(f"编辑消息失败(streaming): {e!s}")
 
@@ -1271,6 +1730,7 @@ class TelegramCallbackQueryEvent(AstrMessageEvent):
         callback_query_id: str,
         data: str,
         from_user_id: str,
+        from_username: str | None,
         message: object | None,
         inline_message_id: str | None,
         platform_meta: PlatformMetadata,
@@ -1283,6 +1743,8 @@ class TelegramCallbackQueryEvent(AstrMessageEvent):
         """回调数据"""
         self.from_user_id = from_user_id
         """点击按钮的用户ID"""
+        self.from_username = from_username
+        """点击按钮的用户名"""
         self.message = message
         """消息对象（内联模式下可能为 None）"""
         self.inline_message_id = inline_message_id
@@ -1294,8 +1756,9 @@ class TelegramCallbackQueryEvent(AstrMessageEvent):
 
         message_obj = AstrBotMessage()
         message_obj.message = [Plain(data)] if data else []
-        message_obj.type = MessageType.FRIEND_MESSAGE
-        message_obj.sender = from_user_id
+        message_obj.type = MessageType.OTHER_MESSAGE
+        nickname = from_username or from_user_id
+        message_obj.sender = MessageMember(user_id=from_user_id, nickname=nickname)
 
         super().__init__(
             message_str=data,
@@ -1311,10 +1774,10 @@ class TelegramCallbackQueryEvent(AstrMessageEvent):
         return self.from_user_id
 
     def get_sender_name(self) -> str:
-        return self.from_user_id
+        return self.from_username or self.from_user_id
 
     def get_message_type(self) -> MessageType:
-        return MessageType.FRIEND_MESSAGE
+        return MessageType.OTHER_MESSAGE
 
     def _chain_to_text(self, message_chain: MessageChain) -> str:
         text = message_chain.get_plain_text(with_other_comps_mark=True)
@@ -1337,6 +1800,7 @@ class TelegramCallbackQueryEvent(AstrMessageEvent):
 
         Returns:
             是否成功
+
         """
         try:
             await self.client.answer_callback_query(
@@ -1360,6 +1824,7 @@ class TelegramCallbackQueryEvent(AstrMessageEvent):
             text: 消息文本
             parse_mode: 解析模式（如 MarkdownV2）
             reply_markup: 内联键盘（InlineKeyboardMarkup）
+
         """
         if self.inline_message_id:
             try:

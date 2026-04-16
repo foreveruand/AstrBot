@@ -415,4 +415,6 @@ class ResultDecorateStage(Stage):
 
                 # 引用回复
                 if self.reply_with_quote:
-                    result.chain.insert(0, Reply(id=event.message_obj.message_id))
+                    msg_id = getattr(event.message_obj, "message_id", None)
+                    if msg_id is not None:
+                        result.chain.insert(0, Reply(id=msg_id))
