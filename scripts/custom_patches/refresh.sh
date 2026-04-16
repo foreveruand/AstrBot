@@ -25,6 +25,11 @@ apply_handoff_get_extra_compat() {
   if grep -q 'selected_provider_id = event.get_extra("selected_provider")' "$file"; then
     perl -0pi -e 's/selected_provider_id = event\.get_extra\("selected_provider"\)/get_extra = getattr(event, "get_extra", None)\n            selected_provider_id = (\n                get_extra("selected_provider") if callable(get_extra) else None\n            )/' "$file"
   fi
+
+  local test_file="$worktree/tests/test_tool_loop_agent_runner.py"
+  if ! grep -q 'def get_provider_by_id(self, _provider_id: str):' "$test_file"; then
+    perl -0pi -e 's/(    async def get_current_chat_provider_id\(self, _umo: str\) -> str:\n        return "provider-id"\n)/$1\n    def get_provider_by_id(self, _provider_id: str):\n        return MockProvider()\n/' "$test_file"
+  fi
 }
 
 make_patch() {

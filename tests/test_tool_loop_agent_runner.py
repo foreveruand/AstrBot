@@ -331,6 +331,9 @@ class BlockingSubagentContext:
     async def get_current_chat_provider_id(self, _umo: str) -> str:
         return "provider-id"
 
+    def get_provider_by_id(self, _provider_id: str):
+        return MockProvider()
+
     def get_config(self, **_kwargs):
         return {"provider_settings": {}}
 

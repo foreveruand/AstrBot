@@ -2207,3 +2207,17 @@ index 0000000000000000000000000000000000000000..038400f44b6d3663cc2d844eb3428063
 +
 +    client.edit_message_media.assert_not_awaited()
 +    client.edit_message_text.assert_awaited_once()
+diff --git a/tests/test_tool_loop_agent_runner.py b/tests/test_tool_loop_agent_runner.py
+index 90651a23d9018ce39910ca5e4069c66b8efd02e1..0a0802d79724ed31c17fb4e422b9db7d9d77437f 100644
+--- a/tests/test_tool_loop_agent_runner.py
++++ b/tests/test_tool_loop_agent_runner.py
+@@ -331,6 +331,9 @@ class BlockingSubagentContext:
+     async def get_current_chat_provider_id(self, _umo: str) -> str:
+         return "provider-id"
+ 
++    def get_provider_by_id(self, _provider_id: str):
++        return MockProvider()
++
+     def get_config(self, **_kwargs):
+         return {"provider_settings": {}}
+ 
