@@ -99,6 +99,54 @@ class WakingCheckStage(Stage):
                 event.role = "admin"
                 break
 
+        # Telegram 回调查询事件：跳过唤醒逻辑，直接分发对应 handler
+        if hasattr(event, "callback_query_id"):
+            enabled_plugins_name = self.ctx.astrbot_config.get("plugin_set", ["*"])
+            if enabled_plugins_name == ["*"]:
+                event.plugins_name = None
+            else:
+                event.plugins_name = enabled_plugins_name
+            logger.debug(f"enabled_plugins_name: {enabled_plugins_name}")
+
+            event.is_wake = True
+            event.is_at_or_wake_command = True
+
+            activated_handlers = star_handlers_registry.get_handlers_by_event_type(
+                EventType.CallbackQueryEvent,
+                plugins_name=event.plugins_name,
+            )
+            activated_handlers = await SessionPluginManager.filter_handlers_by_session(
+                event,
+                activated_handlers,
+            )
+            event.set_extra("activated_handlers", activated_handlers)
+            event.set_extra("handlers_parsed_params", {})
+            return
+
+        # Telegram 选择内联结果事件：跳过唤醒逻辑，直接分发对应 handler
+        if hasattr(event, "result_id") and hasattr(event, "inline_message_id"):
+            enabled_plugins_name = self.ctx.astrbot_config.get("plugin_set", ["*"])
+            if enabled_plugins_name == ["*"]:
+                event.plugins_name = None
+            else:
+                event.plugins_name = enabled_plugins_name
+            logger.debug(f"enabled_plugins_name: {enabled_plugins_name}")
+
+            event.is_wake = True
+            event.is_at_or_wake_command = True
+
+            activated_handlers = star_handlers_registry.get_handlers_by_event_type(
+                EventType.ChosenInlineResultEvent,
+                plugins_name=event.plugins_name,
+            )
+            activated_handlers = await SessionPluginManager.filter_handlers_by_session(
+                event,
+                activated_handlers,
+            )
+            event.set_extra("activated_handlers", activated_handlers)
+            event.set_extra("handlers_parsed_params", {})
+            return
+
         # 检查 wake
         wake_prefixes = self.ctx.astrbot_config["wake_prefix"]
         messages = event.get_messages()

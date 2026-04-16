@@ -737,3 +737,58 @@ def register_after_message_sent(**kwargs):
         return awaitable
 
     return decorator
+
+
+def register_inline_query(**kwargs):
+    """注册 Telegram 内联查询事件处理器
+
+    Hook 参数:
+        event: TelegramInlineQueryEvent
+
+    说明:
+        当用户在 Telegram 中输入 @botname query 时触发
+    """
+
+    def decorator(awaitable):
+        _ = get_handler_or_create(awaitable, EventType.InlineQueryEvent, **kwargs)
+        return awaitable
+
+    return decorator
+
+
+def register_chosen_inline_result(**kwargs):
+    """注册 Telegram 选择内联结果事件处理器
+
+    Hook 参数:
+        event: TelegramChosenInlineResultEvent
+
+    说明:
+        当用户选择了一个内联查询结果时触发
+    """
+
+    def decorator(awaitable):
+        _ = get_handler_or_create(
+            awaitable, EventType.ChosenInlineResultEvent, **kwargs
+        )
+        return awaitable
+
+    return decorator
+
+
+def register_callback_query(**kwargs):
+    """注册 Telegram 回调查询事件处理器
+
+    Hook 参数:
+        event: TelegramCallbackQueryEvent
+
+    说明:
+        当用户点击内联键盘按钮时触发
+    """
+
+    def decorator(awaitable):
+        _ = get_handler_or_create(
+            awaitable, EventType.CallbackQueryEvent, **kwargs
+        )
+        return awaitable
+
+    return decorator

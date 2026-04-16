@@ -15,7 +15,17 @@ from asyncio import Queue
 
 from astrbot.core import logger
 from astrbot.core.astrbot_config_mgr import AstrBotConfigManager
+from astrbot.core.message.message_event_result import (
+    CommandResult,
+    MessageChain,
+    MessageEventResult,
+    ResultContentType,
+)
+from astrbot.core.pipeline.context_utils import call_handler
 from astrbot.core.pipeline.scheduler import PipelineScheduler
+from astrbot.core.star.session_plugin_manager import SessionPluginManager
+from astrbot.core.star.star import star_map
+from astrbot.core.star.star_handler import EventType, star_handlers_registry
 
 from .platform import AstrMessageEvent
 
@@ -41,6 +51,8 @@ class EventBus:
             conf_id = conf_info["id"]
             conf_name = conf_info.get("name") or conf_id
             self._print_event(event, conf_name)
+            if await self._maybe_handle_inline_query(event):
+                continue
             scheduler = self.pipeline_scheduler_mapping.get(conf_id)
             if not scheduler:
                 logger.error(
@@ -48,6 +60,71 @@ class EventBus:
                 )
                 continue
             asyncio.create_task(scheduler.execute(event))
+
+    async def _maybe_handle_inline_query(self, event: AstrMessageEvent) -> bool:
+        if not hasattr(event, "inline_query_id"):
+            return False
+        if hasattr(event, "inline_message_id"):
+            return False
+
+        query = str(getattr(event, "query", "") or "").strip()
+        conf = self.astrbot_config_mgr.get_conf(event.unified_msg_origin)
+        enabled_plugins_name = conf.get("plugin_set", ["*"])
+        if enabled_plugins_name == ["*"]:
+            event.plugins_name = None
+        else:
+            event.plugins_name = enabled_plugins_name
+
+        handlers = star_handlers_registry.get_handlers_by_event_type(
+            EventType.InlineQueryEvent,
+            plugins_name=event.plugins_name,
+        )
+        handlers = await SessionPluginManager.filter_handlers_by_session(
+            event,
+            handlers,
+        )
+        handled = False
+
+        for handler in handlers:
+            md = star_map.get(handler.handler_module_path)
+            if not md:
+                continue
+            try:
+                wrapper = call_handler(event, handler.handler)
+                async for _ in wrapper:
+                    if await self._dispatch_inline_result(event):
+                        handled = True
+                        break
+                event.clear_result()
+            except Exception as e:
+                logger.error(
+                    f"InlineQuery handler error: {md.name} - {handler.handler_name}: {e}",
+                    exc_info=True,
+                )
+
+            if event.is_stopped():
+                break
+
+        if not handled and query:
+            await event.send(MessageChain().message(query))
+            handled = True
+
+        return True
+
+    async def _dispatch_inline_result(self, event: AstrMessageEvent) -> bool:
+        result = event.get_result()
+        if result is None:
+            return False
+        if isinstance(result, MessageEventResult | CommandResult):
+            if result.result_content_type == ResultContentType.STREAMING_RESULT:
+                if result.async_stream is None:
+                    logger.warning("async_stream 为空，跳过发送。")
+                    return True
+                await event.send_streaming(result.async_stream)
+                return True
+            await event.send(result)
+            return True
+        return False
 
     def _print_event(self, event: AstrMessageEvent, conf_name: str) -> None:
         """用于记录事件信息

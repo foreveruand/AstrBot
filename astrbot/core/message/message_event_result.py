@@ -29,6 +29,8 @@ class MessageChain:
     use_t2i_: bool | None = None  # None 为跟随用户设置
     type: str | None = None
     """消息链承载的消息的类型。可选，用于让消息平台区分不同业务场景的消息链。"""
+    reply_markup: dict | list | None = None
+    # 用于存储 Telegram inline keyboard 数据（dict 或 list 格式）
 
     def message(self, message: str):
         """添加一条文本消息到消息链 `chain` 中。
@@ -74,17 +76,22 @@ class MessageChain:
         self.chain.append(Plain(message))
         return self
 
-    def url_image(self, url: str):
+    def url_image(self, url: str, use_spoiler: bool = False):
         """添加一条图片消息（https 链接）到消息链 `chain` 中。
 
         Note:
             如果需要发送本地图片，请使用 `file_image` 方法。
 
+        Args:
+            url: 图片的 URL 地址
+            use_spoiler: 是否将图片标记为剧透（模糊显示），Telegram 平台支持
+
         Example:
-            CommandResult().image("https://example.com/image.jpg")
+            CommandResult().url_image("https://example.com/image.jpg")
+            CommandResult().url_image("https://example.com/image.jpg", use_spoiler=True)
 
         """
-        self.chain.append(Image.fromURL(url))
+        self.chain.append(Image.fromURL(url, use_spoiler=use_spoiler))
         return self
 
     def file_image(self, path: str):
@@ -116,6 +123,24 @@ class MessageChain:
 
         """
         self.use_t2i_ = use_t2i
+        return self
+
+    def inline_keyboard(self, keyboard: list):
+        """设置内联键盘（用于 Telegram 平台）
+
+        Args:
+            keyboard: 键盘按钮列表，格式为二维数组
+                例如: [[{"text": "Button 1", "callback_data": "btn1"}]]
+
+        Returns:
+            self，支持链式调用
+
+        Example:
+            MessageChain().message("Hello").inline_keyboard([
+                [{"text": "Click me", "callback_data": "click"}]
+            ])
+        """
+        self.reply_markup = keyboard
         return self
 
     def get_plain_text(self, with_other_comps_mark: bool = False) -> str:

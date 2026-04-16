@@ -9,10 +9,15 @@ from astrbot.core.star.filter.platform_adapter_type import (
     PlatformAdapterTypeFilter,
 )
 from astrbot.core.star.register import register_after_message_sent as after_message_sent
+from astrbot.core.star.register import (
+    register_chosen_inline_result as chosen_inline_result,
+)
+from astrbot.core.star.register import register_callback_query as callback_query
 from astrbot.core.star.register import register_command as command
 from astrbot.core.star.register import register_command_group as command_group
 from astrbot.core.star.register import register_custom_filter as custom_filter
 from astrbot.core.star.register import register_event_message_type as event_message_type
+from astrbot.core.star.register import register_inline_query as inline_query
 from astrbot.core.star.register import register_llm_tool as llm_tool
 from astrbot.core.star.register import register_on_agent_begin as on_agent_begin
 from astrbot.core.star.register import register_on_agent_done as on_agent_done
@@ -48,10 +53,13 @@ __all__ = [
     "PlatformAdapterType",
     "PlatformAdapterTypeFilter",
     "after_message_sent",
+    "callback_query",
+    "chosen_inline_result",
     "command",
     "command_group",
     "custom_filter",
     "event_message_type",
+    "inline_query",
     "llm_tool",
     "on_agent_begin",
     "on_agent_done",

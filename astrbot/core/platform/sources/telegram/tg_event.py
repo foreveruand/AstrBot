@@ -1,11 +1,20 @@
 import asyncio
+import hashlib
+import inspect
 import os
 import re
 from collections.abc import Callable
 from typing import Any, cast
 
 import telegramify_markdown
-from telegram import ReactionTypeCustomEmoji, ReactionTypeEmoji
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InlineQueryResultArticle,
+    InputTextMessageContent,
+    ReactionTypeCustomEmoji,
+    ReactionTypeEmoji,
+)
 from telegram.constants import ChatAction
 from telegram.error import BadRequest
 from telegram.ext import ExtBot
@@ -272,8 +281,6 @@ class TelegramPlatformEvent(AstrMessageEvent):
         message: MessageChain,
         user_name: str,
     ) -> None:
-        image_path = None
-
         has_reply = False
         reply_message_id = None
         at_user_id = None
@@ -284,17 +291,56 @@ class TelegramPlatformEvent(AstrMessageEvent):
             if isinstance(i, At):
                 at_user_id = i.name
 
+        # Handle reply_markup (inline keyboard)
+        reply_markup_keyboard = None
+        if hasattr(message, "reply_markup") and message.reply_markup:
+            try:
+                keyboard_buttons = []
+                for row in message.reply_markup:
+                    button_row = []
+                    for button in row:
+                        button_row.append(InlineKeyboardButton(**button))
+                    keyboard_buttons.append(button_row)
+                reply_markup_keyboard = InlineKeyboardMarkup(keyboard_buttons)
+            except Exception as e:
+                logger.warning(
+                    f"Failed to convert reply_markup to InlineKeyboardMarkup: {e}"
+                )
+
         at_flag = False
         message_thread_id = None
         if "#" in user_name:
             # it's a supergroup chat with message_thread_id
             user_name, message_thread_id = user_name.split("#")
 
-        # 根据消息链确定合适的 chat action 并发送
+        plain_texts: list[str] = []
+        images: list[Image] = []
+        videos: list[Video] = []
+        files: list[File] = []
+        records: list[Record] = []
+
+        for i in message.chain:
+            if isinstance(i, Plain):
+                if at_user_id and not at_flag:
+                    plain_texts.append(f"@{at_user_id} {i.text}")
+                    at_flag = True
+                else:
+                    plain_texts.append(i.text)
+            elif isinstance(i, Image):
+                images.append(i)
+            elif isinstance(i, Video):
+                videos.append(i)
+            elif isinstance(i, File):
+                files.append(i)
+            elif isinstance(i, Record):
+                records.append(i)
+
+        full_text = " ".join(plain_texts) if plain_texts else None
+
         action = cls._get_chat_action_for_chain(message.chain)
         await cls._send_chat_action(client, user_name, action, message_thread_id)
 
-        for i in message.chain:
+        def get_base_payload() -> dict:
             payload = {
                 "chat_id": user_name,
             }
@@ -302,43 +348,164 @@ class TelegramPlatformEvent(AstrMessageEvent):
                 payload["reply_to_message_id"] = str(reply_message_id)
             if message_thread_id:
                 payload["message_thread_id"] = message_thread_id
+            return payload
 
-            if isinstance(i, Plain):
-                if at_user_id and not at_flag:
-                    i.text = f"@{at_user_id} {i.text}"
-                    at_flag = True
-                await cls._send_text_chunks(client, i.text, payload)
-            elif isinstance(i, Image):
-                image_path = await i.convert_to_file_path()
+        if images:
+            first_image = images[0]
+            image_path = await first_image.convert_to_file_path()
+            payload = get_base_payload()
+            if full_text:
+                # Telegram caption 限制 1024 字符
+                caption = full_text[:1024] if len(full_text) > 1024 else full_text
+                try:
+                    caption = telegramify_markdown.markdownify(caption)
+                    payload["parse_mode"] = "MarkdownV2"
+                except Exception as e:
+                    logger.warning(f"Caption markdownify failed: {e}, using plain text")
                 if _is_gif(image_path):
-                    send_coro = client.send_animation
-                    media_kwarg = {"animation": image_path}
+                    await client.send_animation(
+                        animation=image_path,
+                        caption=caption,
+                        **cast(Any, payload),
+                    )
                 else:
-                    send_coro = client.send_photo
-                    media_kwarg = {"photo": image_path}
-                await send_coro(**media_kwarg, **cast(Any, payload))
-            elif isinstance(i, File):
-                path = await i.get_file()
-                name = i.name or os.path.basename(path)
-                await client.send_document(
-                    document=path, filename=name, **cast(Any, payload)
-                )
-            elif isinstance(i, Record):
-                path = await i.convert_to_file_path()
-                await cls._send_voice_with_fallback(
-                    client,
-                    path,
-                    payload,
-                    caption=i.text or None,
-                    use_media_action=False,
-                )
-            elif isinstance(i, Video):
-                path = await i.convert_to_file_path()
+                    await client.send_photo(
+                        photo=image_path,
+                        caption=caption,
+                        has_spoiler=first_image.use_spoiler,
+                        **cast(Any, payload),
+                    )
+            else:
+                if _is_gif(image_path):
+                    await client.send_animation(
+                        animation=image_path,
+                        **cast(Any, payload),
+                    )
+                else:
+                    await client.send_photo(
+                        photo=image_path,
+                        has_spoiler=first_image.use_spoiler,
+                        **cast(Any, payload),
+                    )
+
+            for img in images[1:]:
+                image_path = await img.convert_to_file_path()
+                payload = get_base_payload()
+                if _is_gif(image_path):
+                    await client.send_animation(
+                        animation=image_path,
+                        **cast(Any, payload),
+                    )
+                else:
+                    await client.send_photo(
+                        photo=image_path,
+                        has_spoiler=img.use_spoiler,
+                        **cast(Any, payload),
+                    )
+
+            if full_text and len(full_text) > 1024:
+                remaining_text = full_text[1024:]
+                chunks = cls._split_message(remaining_text)
+                for chunk in chunks:
+                    payload = get_base_payload()
+                    payload["disable_web_page_preview"] = True
+                    try:
+                        md_text = telegramify_markdown.markdownify(chunk)
+                        await client.send_message(
+                            text=md_text,
+                            parse_mode="MarkdownV2",
+                            **cast(Any, payload),
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"MarkdownV2 send failed: {e}. Using plain text instead.",
+                        )
+                        await client.send_message(text=chunk, **cast(Any, payload))
+        elif videos:
+            first_video = videos[0]
+            path = await first_video.convert_to_file_path()
+            payload = get_base_payload()
+            caption = getattr(first_video, "text", None) or full_text
+            if caption:
+                caption = caption[:1024] if len(caption) > 1024 else caption
+                try:
+                    caption = telegramify_markdown.markdownify(caption)
+                    payload["parse_mode"] = "MarkdownV2"
+                except Exception as e:
+                    logger.warning(f"Caption markdownify failed: {e}")
+            await client.send_video(
+                video=path,
+                caption=caption,
+                **cast(Any, payload),
+            )
+
+            for vid in videos[1:]:
+                path = await vid.convert_to_file_path()
+                payload = get_base_payload()
                 await client.send_video(
                     video=path,
-                    caption=getattr(i, "text", None) or None,
+                    caption=getattr(vid, "text", None),
                     **cast(Any, payload),
                 )
+
+            if full_text and len(full_text) > 1024:
+                remaining_text = full_text[1024:]
+                chunks = cls._split_message(remaining_text)
+                for chunk in chunks:
+                    payload = get_base_payload()
+                    try:
+                        md_text = telegramify_markdown.markdownify(chunk)
+                        await client.send_message(
+                            text=md_text,
+                            parse_mode="MarkdownV2",
+                            **cast(Any, payload),
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"MarkdownV2 send failed: {e}. Using plain text instead.",
+                        )
+                        await client.send_message(text=chunk, **cast(Any, payload))
+        elif full_text:
+            chunks = cls._split_message(full_text)
+            for i, chunk in enumerate(chunks):
+                payload = get_base_payload()
+                payload["disable_web_page_preview"] = True
+                try:
+                    md_text = telegramify_markdown.markdownify(chunk)
+                    await client.send_message(
+                        text=md_text,
+                        parse_mode="MarkdownV2",
+                        reply_markup=reply_markup_keyboard if i == 0 else None,
+                        **cast(Any, payload),
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"MarkdownV2 send failed: {e}. Using plain text instead.",
+                    )
+                    await client.send_message(
+                        text=chunk,
+                        reply_markup=reply_markup_keyboard if i == 0 else None,
+                        **cast(Any, payload),
+                    )
+
+        for f in files:
+            payload = get_base_payload()
+            path = await f.get_file()
+            name = f.name or os.path.basename(path)
+            await client.send_document(
+                document=path, filename=name, **cast(Any, payload)
+            )
+
+        for r in records:
+            payload = get_base_payload()
+            path = await r.convert_to_file_path()
+            await cls._send_voice_with_fallback(
+                client,
+                path,
+                payload,
+                caption=r.text or None,
+                use_media_action=False,
+            )
 
     async def send(self, message: MessageChain) -> None:
         if self.get_message_type() == MessageType.GROUP_MESSAGE:
@@ -733,3 +900,582 @@ class TelegramPlatformEvent(AstrMessageEvent):
                     )
         except Exception as e:
             logger.warning(f"编辑消息失败(streaming): {e!s}")
+
+
+class TelegramInlineQueryEvent(AstrMessageEvent):
+    """Telegram 内联查询事件"""
+
+    MAX_INLINE_RESULTS = 50
+    MAX_INLINE_DESCRIPTION_LEN = 100
+    _INLINE_ARTICLE_PARAMS: set[str] | None = None
+
+    def __init__(
+        self,
+        query: str,
+        from_user_id: str,
+        inline_query_id: str,
+        offset: str,
+        platform_meta: PlatformMetadata,
+        session_id: str,
+        client: ExtBot,
+    ) -> None:
+        self.query = query
+        """内联查询的文本"""
+        self.from_user_id = from_user_id
+        """发起查询的用户ID"""
+        self.inline_query_id = inline_query_id
+        """内联查询的唯一ID"""
+        self.offset = offset
+        """分页偏移量"""
+        self.client = client
+        self._inline_answer_seq = 0
+        self._bot_thumb_url: str | None = None
+
+        # 创建一个虚拟的 AstrBotMessage 用于兼容性
+        from astrbot.api.platform import AstrBotMessage, MessageType
+
+        message_obj = AstrBotMessage()
+        message_obj.message = [Plain(query)] if query else []
+        message_obj.type = MessageType.OTHER_MESSAGE  # 内联查询视为系统消息
+        message_obj.sender = from_user_id
+
+        super().__init__(
+            message_str=query,
+            message_obj=message_obj,
+            platform_meta=platform_meta,
+            session_id=session_id,
+        )
+
+    def get_sender_id(self) -> str:
+        return self.from_user_id
+
+    def get_sender_name(self) -> str:
+        return self.from_user_id  # Telegram 用户名可能不可用
+
+    def get_message_type(self) -> MessageType:
+        return MessageType.OTHER_MESSAGE
+
+    def _chain_to_text(self, message_chain: MessageChain) -> str:
+        text = message_chain.get_plain_text(with_other_comps_mark=True)
+        return text.strip()
+
+    async def _get_bot_thumb_url(self) -> str | None:
+        if self._bot_thumb_url is not None:
+            return self._bot_thumb_url
+        try:
+            me = await self.client.get_me()
+            photos = await self.client.get_user_profile_photos(me.id, limit=1)
+            if photos.total_count <= 0:
+                self._bot_thumb_url = ""
+                return None
+            first_photo = photos.photos[0][-1]
+            file_obj = await self.client.get_file(first_photo.file_id)
+            url = getattr(file_obj, "file_path", None)
+            if isinstance(url, str) and url:
+                self._bot_thumb_url = url
+                return url
+        except Exception as e:
+            logger.debug(f"获取 bot 头像失败: {e!s}")
+        self._bot_thumb_url = ""
+        return None
+
+    async def _build_inline_results(self, text: str) -> list[InlineQueryResultArticle]:
+        if not text:
+            return []
+        chunks = TelegramPlatformEvent._split_message(text)
+        thumb_url = "https://user-images.githubusercontent.com/11541888/223106202-7576ff11-2c8e-408d-94ea-b02a7a32149a.png"
+        if self._INLINE_ARTICLE_PARAMS is None:
+            try:
+                self._INLINE_ARTICLE_PARAMS = set(
+                    inspect.signature(InlineQueryResultArticle).parameters.keys(),
+                )
+            except Exception:
+                self._INLINE_ARTICLE_PARAMS = set()
+        results: list[InlineQueryResultArticle] = []
+        for idx, chunk in enumerate(chunks[: self.MAX_INLINE_RESULTS]):
+            raw_id = f"{self.inline_query_id}:{self._inline_answer_seq}:{idx}"
+            hashed = hashlib.blake2b(raw_id.encode("utf-8"), digest_size=6).hexdigest()
+            result_id = f"ab-{hashed}"
+            title = "AstrBot"
+            description = chunk.replace("\n", " ").strip()
+            if len(description) > self.MAX_INLINE_DESCRIPTION_LEN:
+                description = description[: self.MAX_INLINE_DESCRIPTION_LEN - 1] + "…"
+            kwargs = {
+                "id": result_id,
+                "title": title,
+                "description": description,
+                "input_message_content": InputTextMessageContent(
+                    message_text=chunk[: TelegramPlatformEvent.MAX_MESSAGE_LENGTH],
+                ),
+                "reply_markup": InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                "Bot正在思考 🤖", callback_data="astrbot_thinking"
+                            )
+                        ]
+                    ],
+                ),
+            }
+            if thumb_url:
+                if "thumb_url" in self._INLINE_ARTICLE_PARAMS:
+                    kwargs["thumb_url"] = thumb_url
+                elif "thumbnail_url" in self._INLINE_ARTICLE_PARAMS:
+                    kwargs["thumbnail_url"] = thumb_url
+            results.append(
+                InlineQueryResultArticle(**kwargs),
+            )
+        return results
+
+    async def _answer_inline_query(self, text: str) -> None:
+        results = await self._build_inline_results(text)
+        if not results:
+            logger.warning(
+                "TelegramInlineQueryEvent 空结果，跳过 answer_inline_query。"
+            )
+            return
+        self._inline_answer_seq += 1
+        try:
+            await self.client.answer_inline_query(
+                inline_query_id=self.inline_query_id,
+                results=results,
+                cache_time=0,
+                is_personal=True,
+            )
+        except Exception as e:
+            logger.warning(f"answer_inline_query 失败: {e!s}")
+
+    async def send_with_client(
+        self, client: ExtBot, message_chain: MessageChain, user_name: str
+    ) -> None:
+        """内联查询通过 answer_inline_query 响应"""
+        _ = client
+        _ = user_name
+        text = self._chain_to_text(message_chain)
+        if not text:
+            logger.warning("TelegramInlineQueryEvent 消息为空，跳过发送。")
+            return
+        await self._answer_inline_query(text)
+
+    async def send(self, message: MessageChain) -> None:
+        await self.send_with_client(self.client, message, self.get_sender_id())
+        await super().send(message)
+
+    async def send_streaming(self, generator, use_fallback: bool = False):
+        if not self.inline_query_id:
+            logger.warning(
+                "TelegramInlineQueryEvent 缺少 inline_query_id，无法流式响应。"
+            )
+            return
+        delta = ""
+        last_send_time = 0.0
+        throttle_interval = 0.6
+        loop = asyncio.get_running_loop()
+
+        async for chain in generator:
+            if not isinstance(chain, MessageChain):
+                continue
+            if chain.type == "break":
+                if delta:
+                    await self._answer_inline_query(delta)
+                delta = ""
+                continue
+            delta += chain.get_plain_text(with_other_comps_mark=True)
+            now = loop.time()
+            if now - last_send_time >= throttle_interval:
+                await self._answer_inline_query(delta)
+                last_send_time = now
+
+        if delta:
+            await self._answer_inline_query(delta)
+
+        await super().send_streaming(generator, use_fallback)
+
+
+class TelegramChosenInlineResultEvent(AstrMessageEvent):
+    """Telegram 选择内联结果事件"""
+
+    def __init__(
+        self,
+        result_id: str,
+        from_user_id: str,
+        query: str,
+        inline_message_id: str | None,
+        platform_meta: PlatformMetadata,
+        session_id: str,
+        client: ExtBot,
+    ) -> None:
+        self.result_id = result_id
+        """被选择的结果ID"""
+        self.from_user_id = from_user_id
+        """选择结果的用户ID"""
+        self.query = query
+        """原始查询文本"""
+        self.inline_message_id = inline_message_id
+        """内联消息ID（如果适用）"""
+        self.client = client
+
+        # 创建一个虚拟的 AstrBotMessage 用于兼容性
+        from astrbot.api.platform import AstrBotMessage, MessageType
+
+        message_obj = AstrBotMessage()
+        message_obj.message = [Plain(query)] if query else []
+        message_obj.type = MessageType.OTHER_MESSAGE  # 选择结果视为系统消息
+        message_obj.sender = from_user_id
+
+        super().__init__(
+            message_str=query,
+            message_obj=message_obj,
+            platform_meta=platform_meta,
+            session_id=session_id,
+        )
+
+    def get_sender_id(self) -> str:
+        return self.from_user_id
+
+    def get_sender_name(self) -> str:
+        return self.from_user_id  # Telegram 用户名可能不可用
+
+    def get_message_type(self) -> MessageType:
+        return MessageType.OTHER_MESSAGE
+
+    def _chain_to_text(self, message_chain: MessageChain) -> str:
+        text = message_chain.get_plain_text(with_other_comps_mark=True)
+        return text.strip()
+
+    async def _edit_inline_message(
+        self, text: str, parse_mode: str | None = None, reply_markup=None
+    ) -> None:
+        if not self.inline_message_id:
+            logger.debug(
+                "TelegramChosenInlineResultEvent 缺少 inline_message_id，跳过编辑。"
+            )
+            return
+        try:
+            await self.client.edit_message_text(
+                text=text[: TelegramPlatformEvent.MAX_MESSAGE_LENGTH],
+                inline_message_id=self.inline_message_id,
+                parse_mode=parse_mode,
+                reply_markup=reply_markup,
+            )
+        except Exception as e:
+            logger.warning(f"编辑内联消息失败: {e!s}")
+
+    async def send_with_client(
+        self, client: ExtBot, message_chain: MessageChain, user_name: str
+    ) -> None:
+        _ = client
+        _ = user_name
+        text = self._chain_to_text(message_chain)
+        if not text:
+            logger.warning("TelegramChosenInlineResultEvent 消息为空，跳过发送。")
+            return
+
+        reply_markup_keyboard = None
+        if hasattr(message_chain, "reply_markup") and message_chain.reply_markup:
+            try:
+                keyboard_buttons = []
+                for row in message_chain.reply_markup:
+                    button_row = []
+                    for button in row:
+                        button_row.append(InlineKeyboardButton(**button))
+                    keyboard_buttons.append(button_row)
+                reply_markup_keyboard = InlineKeyboardMarkup(keyboard_buttons)
+            except Exception as e:
+                logger.warning(
+                    f"Failed to convert reply_markup to InlineKeyboardMarkup: {e}"
+                )
+
+        try:
+            markdown_text = telegramify_markdown.markdownify(text)
+            await self._edit_inline_message(
+                markdown_text, parse_mode="MarkdownV2", reply_markup=reply_markup_keyboard
+            )
+        except Exception as e:
+            logger.warning(f"Markdown转换失败，使用普通文本: {e!s}")
+            await self._edit_inline_message(text, reply_markup=reply_markup_keyboard)
+
+    async def send(self, message: MessageChain) -> None:
+        await self.send_with_client(self.client, message, self.get_sender_id())
+        await super().send(message)
+
+    async def send_streaming(self, generator, use_fallback: bool = False):
+        if not self.inline_message_id:
+            logger.warning(
+                "TelegramChosenInlineResultEvent 缺少 inline_message_id，无法流式编辑消息。"
+            )
+            return
+
+        delta = ""
+        current_content = ""
+        last_edit_time = 0.0
+        throttle_interval = 0.6
+        loop = asyncio.get_running_loop()
+        reply_markup_keyboard = None
+
+        async for chain in generator:
+            if not isinstance(chain, MessageChain):
+                continue
+            if chain.type == "break":
+                delta += "\n"
+                continue
+
+            if hasattr(chain, "reply_markup") and chain.reply_markup:
+                try:
+                    keyboard_buttons = []
+                    for row in chain.reply_markup:
+                        button_row = []
+                        for button in row:
+                            button_row.append(InlineKeyboardButton(**button))
+                        keyboard_buttons.append(button_row)
+                    reply_markup_keyboard = InlineKeyboardMarkup(keyboard_buttons)
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to convert reply_markup to InlineKeyboardMarkup: {e}"
+                    )
+
+            delta += chain.get_plain_text(with_other_comps_mark=True)
+            now = loop.time()
+            if now - last_edit_time >= throttle_interval:
+                await self._edit_inline_message(delta)
+                current_content = delta
+                last_edit_time = now
+
+        try:
+            if delta and current_content != delta:
+                try:
+                    markdown_text = telegramify_markdown.markdownify(delta)
+                    await self._edit_inline_message(
+                        markdown_text,
+                        parse_mode="MarkdownV2",
+                        reply_markup=reply_markup_keyboard,
+                    )
+                except Exception as e:
+                    logger.warning(f"Markdown转换失败，使用普通文本: {e!s}")
+                    await self._edit_inline_message(delta, reply_markup=reply_markup_keyboard)
+        except Exception as e:
+            logger.warning(f"编辑消息失败(streaming): {e!s}")
+
+        await super().send_streaming(generator, use_fallback)
+
+
+class TelegramCallbackQueryEvent(AstrMessageEvent):
+    """Telegram 回调查询事件（键盘按钮点击）"""
+
+    def __init__(
+        self,
+        callback_query_id: str,
+        data: str,
+        from_user_id: str,
+        message: object | None,
+        inline_message_id: str | None,
+        platform_meta: PlatformMetadata,
+        session_id: str,
+        client: ExtBot,
+    ) -> None:
+        self.callback_query_id = callback_query_id
+        """回调查询ID"""
+        self.data = data
+        """回调数据"""
+        self.from_user_id = from_user_id
+        """点击按钮的用户ID"""
+        self.message = message
+        """消息对象（内联模式下可能为 None）"""
+        self.inline_message_id = inline_message_id
+        """内联消息ID（内联模式下使用）"""
+        self.client = client
+
+        # 创建一个虚拟的 AstrBotMessage 用于兼容性
+        from astrbot.api.platform import AstrBotMessage, MessageType
+
+        message_obj = AstrBotMessage()
+        message_obj.message = [Plain(data)] if data else []
+        message_obj.type = MessageType.FRIEND_MESSAGE
+        message_obj.sender = from_user_id
+
+        super().__init__(
+            message_str=data,
+            message_obj=message_obj,
+            platform_meta=platform_meta,
+            session_id=session_id,
+        )
+
+        # 阻止 LLM 处理：回调事件仅由插件处理
+        self.call_llm = True
+
+    def get_sender_id(self) -> str:
+        return self.from_user_id
+
+    def get_sender_name(self) -> str:
+        return self.from_user_id
+
+    def get_message_type(self) -> MessageType:
+        return MessageType.FRIEND_MESSAGE
+
+    def _chain_to_text(self, message_chain: MessageChain) -> str:
+        text = message_chain.get_plain_text(with_other_comps_mark=True)
+        return text.strip()
+
+    async def answer_callback_query(
+        self,
+        text: str | None = None,
+        show_alert: bool = False,
+        url: str | None = None,
+        cache_time: int | None = None,
+    ) -> bool:
+        """回应回调查询，可选显示提示消息
+
+        Args:
+            text: 显示给用户的文本
+            show_alert: 是否显示为弹窗而非通知
+            url: 打开的 URL
+            cache_time: 缓存时间（秒）
+
+        Returns:
+            是否成功
+        """
+        try:
+            await self.client.answer_callback_query(
+                callback_query_id=self.callback_query_id,
+                text=text,
+                show_alert=show_alert,
+                url=url,
+                cache_time=cache_time,
+            )
+            return True
+        except Exception as e:
+            logger.warning(f"回应回调查询失败: {e!s}")
+            return False
+
+    async def _edit_message(
+        self, text: str, parse_mode: str | None = None, reply_markup=None
+    ) -> None:
+        """编辑消息（普通消息或内联消息）
+
+        Args:
+            text: 消息文本
+            parse_mode: 解析模式（如 MarkdownV2）
+            reply_markup: 内联键盘（InlineKeyboardMarkup）
+        """
+        if self.inline_message_id:
+            try:
+                await self.client.edit_message_text(
+                    text=text[: TelegramPlatformEvent.MAX_MESSAGE_LENGTH],
+                    inline_message_id=self.inline_message_id,
+                    parse_mode=parse_mode,
+                    reply_markup=reply_markup,
+                )
+            except Exception as e:
+                logger.warning(f"编辑内联消息失败: {e!s}")
+        elif self.message:
+            try:
+                chat_id = self.message.chat.id
+                message_id = self.message.message_id
+                await self.client.edit_message_text(
+                    text=text[: TelegramPlatformEvent.MAX_MESSAGE_LENGTH],
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    parse_mode=parse_mode,
+                    reply_markup=reply_markup,
+                )
+            except Exception as e:
+                logger.warning(f"编辑消息失败: {e!s}")
+        else:
+            logger.debug("TelegramCallbackQueryEvent 无可用消息，跳过编辑。")
+
+    async def send_with_client(
+        self, client: ExtBot, message_chain: MessageChain, user_name: str
+    ) -> None:
+        _ = client
+        _ = user_name
+        text = self._chain_to_text(message_chain)
+        if not text:
+            logger.warning("TelegramCallbackQueryEvent 消息为空，跳过发送。")
+            return
+
+        reply_markup_keyboard = None
+        if hasattr(message_chain, "reply_markup") and message_chain.reply_markup:
+            try:
+                keyboard_buttons = []
+                for row in message_chain.reply_markup:
+                    button_row = []
+                    for button in row:
+                        button_row.append(InlineKeyboardButton(**button))
+                    keyboard_buttons.append(button_row)
+                reply_markup_keyboard = InlineKeyboardMarkup(keyboard_buttons)
+            except Exception as e:
+                logger.warning(
+                    f"Failed to convert reply_markup to InlineKeyboardMarkup: {e}"
+                )
+
+        try:
+            markdown_text = telegramify_markdown.markdownify(text)
+            await self._edit_message(
+                markdown_text, parse_mode="MarkdownV2", reply_markup=reply_markup_keyboard
+            )
+        except Exception as e:
+            logger.warning(f"Markdown转换失败，使用普通文本: {e!s}")
+            await self._edit_message(text, reply_markup=reply_markup_keyboard)
+
+    async def send(self, message: MessageChain) -> None:
+        await self.send_with_client(self.client, message, self.get_sender_id())
+        await super().send(message)
+
+    async def send_streaming(self, generator, use_fallback: bool = False):
+        if not self.message and not self.inline_message_id:
+            logger.warning(
+                "TelegramCallbackQueryEvent 缺少 message 和 inline_message_id，无法流式编辑消息。"
+            )
+            return
+
+        delta = ""
+        current_content = ""
+        last_edit_time = 0.0
+        throttle_interval = 0.6
+        loop = asyncio.get_running_loop()
+        reply_markup_keyboard = None
+
+        async for chain in generator:
+            if not isinstance(chain, MessageChain):
+                continue
+            if chain.type == "break":
+                delta += "\n"
+                continue
+
+            if hasattr(chain, "reply_markup") and chain.reply_markup:
+                try:
+                    keyboard_buttons = []
+                    for row in chain.reply_markup:
+                        button_row = []
+                        for button in row:
+                            button_row.append(InlineKeyboardButton(**button))
+                        keyboard_buttons.append(button_row)
+                    reply_markup_keyboard = InlineKeyboardMarkup(keyboard_buttons)
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to convert reply_markup to InlineKeyboardMarkup: {e}"
+                    )
+
+            delta += chain.get_plain_text(with_other_comps_mark=True)
+            now = loop.time()
+            if now - last_edit_time >= throttle_interval:
+                await self._edit_message(delta)
+                current_content = delta
+                last_edit_time = now
+
+        try:
+            if delta and current_content != delta:
+                try:
+                    markdown_text = telegramify_markdown.markdownify(delta)
+                    await self._edit_message(
+                        markdown_text,
+                        parse_mode="MarkdownV2",
+                        reply_markup=reply_markup_keyboard,
+                    )
+                except Exception as e:
+                    logger.warning(f"Markdown转换失败，使用普通文本: {e!s}")
+                    await self._edit_message(delta, reply_markup=reply_markup_keyboard)
+        except Exception as e:
+            logger.warning(f"编辑消息失败(streaming): {e!s}")
+
+        await super().send_streaming(generator, use_fallback)

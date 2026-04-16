@@ -10,7 +10,15 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import BotCommand, Update
 from telegram.constants import ChatType
 from telegram.error import Forbidden, InvalidToken, NetworkError
-from telegram.ext import ApplicationBuilder, ContextTypes, ExtBot, filters
+from telegram.ext import (
+    ApplicationBuilder,
+    CallbackQueryHandler,
+    ChosenInlineResultHandler,
+    ContextTypes,
+    ExtBot,
+    InlineQueryHandler,
+    filters,
+)
 from telegram.ext import MessageHandler as TelegramMessageHandler
 
 import astrbot.api.message_components as Comp
@@ -33,7 +41,12 @@ from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
 from astrbot.core.utils.io import download_file
 from astrbot.core.utils.media_utils import convert_audio_to_wav
 
-from .tg_event import TelegramPlatformEvent
+from .tg_event import (
+    TelegramCallbackQueryEvent,
+    TelegramChosenInlineResultEvent,
+    TelegramInlineQueryEvent,
+    TelegramPlatformEvent,
+)
 
 if sys.version_info >= (3, 12):
     from typing import override
@@ -132,6 +145,15 @@ class TelegramPlatformAdapter(Platform):
             callback=self.message_handler,
         )
         self.application.add_handler(message_handler)
+        self.application.add_handler(
+            InlineQueryHandler(callback=self.inline_query_handler)
+        )
+        self.application.add_handler(
+            ChosenInlineResultHandler(callback=self.chosen_inline_result_handler)
+        )
+        self.application.add_handler(
+            CallbackQueryHandler(callback=self.callback_query_handler)
+        )
         self.client = self.application.bot
         logger.debug(f"Telegram base url: {self.client.base_url}")
 
@@ -730,6 +752,69 @@ class TelegramPlatformAdapter(Platform):
             client=self.client,
         )
         self.commit_event(message_event)
+
+    async def inline_query_handler(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """处理 Telegram 内联查询"""
+        if not update.inline_query:
+            return
+
+        inline_query_event = TelegramInlineQueryEvent(
+            query=update.inline_query.query,
+            from_user_id=str(update.inline_query.from_user.id),
+            inline_query_id=update.inline_query.id,
+            offset=update.inline_query.offset,
+            platform_meta=self.meta(),
+            session_id=str(
+                update.inline_query.from_user.id
+            ),  # 使用用户ID作为session_id
+            client=self.client,
+        )
+        self.commit_event(inline_query_event)
+
+    async def chosen_inline_result_handler(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """处理 Telegram 选择内联结果"""
+        if not update.chosen_inline_result:
+            return
+
+        chosen_result_event = TelegramChosenInlineResultEvent(
+            result_id=update.chosen_inline_result.result_id,
+            from_user_id=str(update.chosen_inline_result.from_user.id),
+            query=update.chosen_inline_result.query,
+            inline_message_id=getattr(
+                update.chosen_inline_result, "inline_message_id", None
+            ),
+            platform_meta=self.meta(),
+            session_id=str(
+                update.chosen_inline_result.from_user.id
+            ),  # 使用用户ID作为session_id
+            client=self.client,
+        )
+        self.commit_event(chosen_result_event)
+
+    async def callback_query_handler(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """处理 Telegram 回调查询（键盘按钮点击）"""
+        if not update.callback_query:
+            return
+
+        callback_event = TelegramCallbackQueryEvent(
+            callback_query_id=update.callback_query.id,
+            data=update.callback_query.data or "",
+            from_user_id=str(update.callback_query.from_user.id),
+            message=update.callback_query.message,
+            inline_message_id=getattr(
+                update.callback_query, "inline_message_id", None
+            ),
+            platform_meta=self.meta(),
+            session_id=str(update.callback_query.from_user.id),
+            client=self.client,
+        )
+        self.commit_event(callback_event)
 
     def get_client(self) -> ExtBot:
         return self.client
