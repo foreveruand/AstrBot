@@ -1189,7 +1189,9 @@ class TelegramChosenInlineResultEvent(AstrMessageEvent):
         try:
             markdown_text = telegramify_markdown.markdownify(text)
             await self._edit_inline_message(
-                markdown_text, parse_mode="MarkdownV2", reply_markup=reply_markup_keyboard
+                markdown_text,
+                parse_mode="MarkdownV2",
+                reply_markup=reply_markup_keyboard,
             )
         except Exception as e:
             logger.warning(f"Markdown转换失败，使用普通文本: {e!s}")
@@ -1252,7 +1254,9 @@ class TelegramChosenInlineResultEvent(AstrMessageEvent):
                     )
                 except Exception as e:
                     logger.warning(f"Markdown转换失败，使用普通文本: {e!s}")
-                    await self._edit_inline_message(delta, reply_markup=reply_markup_keyboard)
+                    await self._edit_inline_message(
+                        delta, reply_markup=reply_markup_keyboard
+                    )
         except Exception as e:
             logger.warning(f"编辑消息失败(streaming): {e!s}")
 
@@ -1411,7 +1415,9 @@ class TelegramCallbackQueryEvent(AstrMessageEvent):
         try:
             markdown_text = telegramify_markdown.markdownify(text)
             await self._edit_message(
-                markdown_text, parse_mode="MarkdownV2", reply_markup=reply_markup_keyboard
+                markdown_text,
+                parse_mode="MarkdownV2",
+                reply_markup=reply_markup_keyboard,
             )
         except Exception as e:
             logger.warning(f"Markdown转换失败，使用普通文本: {e!s}")

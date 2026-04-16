@@ -39,6 +39,11 @@ class ExecuteShellTool(FunctionTool):
                     "additionalProperties": {"type": "string"},
                     "default": {},
                 },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Timeout in seconds for the command execution. Default is 30 seconds.",
+                    "default": 30,
+                },
             },
             "required": ["command"],
         }
@@ -50,6 +55,7 @@ class ExecuteShellTool(FunctionTool):
         command: str,
         background: bool = False,
         env: dict = {},
+        timeout: int = 30,
     ) -> ToolExecResult:
         if permission_error := check_admin_permission(context, "Shell execution"):
             return permission_error
@@ -72,6 +78,7 @@ class ExecuteShellTool(FunctionTool):
                 cwd=cwd,
                 background=background,
                 env=env,
+                timeout=timeout,
             )
             return json.dumps(result, ensure_ascii=False)
         except Exception as e:

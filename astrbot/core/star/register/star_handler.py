@@ -786,9 +786,7 @@ def register_callback_query(**kwargs):
     """
 
     def decorator(awaitable):
-        _ = get_handler_or_create(
-            awaitable, EventType.CallbackQueryEvent, **kwargs
-        )
+        _ = get_handler_or_create(awaitable, EventType.CallbackQueryEvent, **kwargs)
         return awaitable
 
     return decorator

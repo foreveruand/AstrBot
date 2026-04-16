@@ -807,9 +807,7 @@ class TelegramPlatformAdapter(Platform):
             data=update.callback_query.data or "",
             from_user_id=str(update.callback_query.from_user.id),
             message=update.callback_query.message,
-            inline_message_id=getattr(
-                update.callback_query, "inline_message_id", None
-            ),
+            inline_message_id=getattr(update.callback_query, "inline_message_id", None),
             platform_meta=self.meta(),
             session_id=str(update.callback_query.from_user.id),
             client=self.client,

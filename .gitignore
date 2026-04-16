@@ -62,5 +62,5 @@ GenieData/
 .opencode/
 .kilocode/
 .worktrees/
-
+.agents/
 dashboard/bun.lock

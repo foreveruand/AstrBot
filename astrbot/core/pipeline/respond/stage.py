@@ -254,7 +254,9 @@ class RespondStage(Stage):
                         else:
                             reply_markup = result.reply_markup if is_last else None
                             await event.send(
-                                MessageChain([*header_comps, comp], reply_markup=reply_markup)
+                                MessageChain(
+                                    [*header_comps, comp], reply_markup=reply_markup
+                                )
                             )
                             header_comps.clear()
                     except Exception as e:

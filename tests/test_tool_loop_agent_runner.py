@@ -194,6 +194,22 @@ class MockAbortableStreamProvider(MockProvider):
         )
 
 
+class MockStreamingEmptyAfterChunkProvider(MockProvider):
+    async def text_chat_stream(self, **kwargs):
+        self.call_count += 1
+        yield LLMResponse(
+            role="assistant",
+            completion_text="第一段",
+            is_chunk=True,
+        )
+        yield LLMResponse(
+            role="assistant",
+            completion_text="第二段",
+            is_chunk=True,
+        )
+        raise EmptyModelOutputError("stream finished without final response")
+
+
 class MockToolCallProvider(MockProvider):
     def __init__(self, tool_name: str, tool_args: dict[str, str] | None = None):
         super().__init__()
@@ -876,6 +892,38 @@ async def test_empty_output_retries_exhausted_then_uses_fallback_provider(
 
 
 @pytest.mark.asyncio
+async def test_streaming_empty_output_after_chunks_keeps_partial_response_without_fallback(
+    runner, provider_request, mock_tool_executor, mock_hooks, monkeypatch
+):
+    monkeypatch.setattr(runner, "EMPTY_OUTPUT_RETRY_WAIT_MIN_S", 0)
+    monkeypatch.setattr(runner, "EMPTY_OUTPUT_RETRY_WAIT_MAX_S", 0)
+
+    primary_provider = MockStreamingEmptyAfterChunkProvider()
+    fallback_provider = MockProvider()
+    fallback_provider.should_call_tools = False
+
+    await runner.reset(
+        provider=primary_provider,
+        request=provider_request,
+        run_context=ContextWrapper(context=None),
+        tool_executor=mock_tool_executor,
+        agent_hooks=mock_hooks,
+        streaming=True,
+        fallback_providers=[fallback_provider],
+    )
+
+    async for _ in runner.step_until_done(5):
+        pass
+
+    final_resp = runner.get_final_llm_resp()
+    assert final_resp is not None
+    assert final_resp.role == "assistant"
+    assert final_resp.completion_text == "第一段第二段"
+    assert primary_provider.call_count == 1
+    assert fallback_provider.call_count == 0
+
+
+@pytest.mark.asyncio
 async def test_stop_signal_returns_aborted_and_persists_partial_message(
     runner, provider_request, mock_tool_executor, mock_hooks
 ):
@@ -1174,6 +1222,13 @@ async def test_follow_up_accepted_when_active_and_not_stopping(
         agent_hooks=mock_hooks,
         streaming=False,
     )
+    ticket = runner.follow_up(message_text="valid follow-up message")
+    assert ticket is not None, (
+        "Follow-up should be accepted when runner is active and not stopping"
+    )
+    assert ticket.text == "valid follow-up message"
+    assert ticket.consumed is False
+    assert ticket in runner._pending_follow_ups
 
 
 @pytest.mark.asyncio

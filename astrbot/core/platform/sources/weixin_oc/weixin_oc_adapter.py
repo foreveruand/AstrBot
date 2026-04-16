@@ -151,6 +151,9 @@ class WeixinOCAdapter(Platform):
         self._context_tokens: dict[str, str] = {}
         self._typing_states: dict[str, TypingSessionState] = {}
         self._last_inbound_error = ""
+        self._last_activity_ts: float = time.time()
+        self._last_active_user_id: str | None = None
+        self._session_keepalive_task: asyncio.Task | None = None
         self._recent_message_cache_size = self._get_int_config(
             "weixin_oc_recent_message_cache_size",
             self.RECENT_MESSAGE_CACHE_SIZE,
@@ -174,6 +177,18 @@ class WeixinOCAdapter(Platform):
         self._typing_ticket_ttl_s = max(
             5,
             int(platform_config.get("weixin_oc_typing_ticket_ttl", 60)),
+        )
+        self._session_keepalive_threshold_h = max(
+            1,
+            int(platform_config.get("weixin_oc_session_keepalive_threshold_h", 20)),
+        )
+        self._session_keepalive_check_interval_s = max(
+            60,
+            int(
+                platform_config.get(
+                    "weixin_oc_session_keepalive_check_interval_s", 1800
+                )
+            ),
         )
 
         self.token = str(platform_config.get("weixin_oc_token", "")).strip() or None
@@ -561,6 +576,83 @@ class WeixinOCAdapter(Platform):
         self._sync_client_state()
         astrbot_config.save_config()
 
+    @staticmethod
+    def _is_session_expired(ret: int, errcode: int) -> bool:
+        return ret == -14 or errcode == -14
+
+    async def _handle_session_expired(self) -> None:
+        logger.error(
+            "weixin_oc(%s): session expired, clearing token for re-login",
+            self.meta().id,
+        )
+        self.token = None
+        self.client.token = None
+        self._login_session = None
+        self._last_inbound_error = "session expired, need re-login"
+        await self._cancel_task_safely(
+            self._session_keepalive_task,
+            log_message="weixin_oc(%s): keepalive task cancel error on session expiry",
+            log_args=(self.meta().id,),
+        )
+        self._session_keepalive_task = None
+        await self._save_account_state()
+
+    async def _session_keepalive_loop(self) -> None:
+        while not self._shutdown_event.is_set():
+            await asyncio.sleep(self._session_keepalive_check_interval_s)
+            if self._shutdown_event.is_set() or not self.token:
+                return
+
+            idle_seconds = time.time() - self._last_activity_ts
+            idle_hours = idle_seconds / 3600
+            if idle_hours < self._session_keepalive_threshold_h:
+                continue
+
+            user_id = self._last_active_user_id
+            if not user_id or user_id not in self._context_tokens:
+                for uid in self._context_tokens:
+                    user_id = uid
+                    break
+
+            if not user_id:
+                logger.warning(
+                    "weixin_oc(%s): session keepalive skipped, "
+                    "no user with context token available",
+                    self.meta().id,
+                )
+                continue
+
+            remaining_h = max(0, 24 - idle_hours)
+            text = (
+                f"[系统提醒] 您的 Bot 已超过 {int(idle_hours)} 小时未收到消息，"
+                f"距离会话过期还有约 {int(remaining_h)} 小时。"
+                f"请回复任意内容以保持会话活跃。"
+            )
+            try:
+                success = await self._send_items_to_session(
+                    user_id,
+                    [self._build_plain_text_item(text)],
+                )
+                if success:
+                    logger.info(
+                        "weixin_oc(%s): session keepalive sent to %s (idle %.1fh)",
+                        self.meta().id,
+                        user_id,
+                        idle_hours,
+                    )
+                else:
+                    logger.warning(
+                        "weixin_oc(%s): session keepalive send failed for %s",
+                        self.meta().id,
+                        user_id,
+                    )
+            except Exception as e:
+                logger.warning(
+                    "weixin_oc(%s): session keepalive error: %s",
+                    self.meta().id,
+                    e,
+                )
+
     def _is_login_session_valid(
         self, login_session: OpenClawLoginSession | None
     ) -> bool:
@@ -901,6 +993,7 @@ class WeixinOCAdapter(Platform):
                 include_ref_text=False,
             ),
         )
+        self._last_activity_ts = time.time()
         return True
 
     def _build_cache_components_from_items(
@@ -1443,6 +1536,9 @@ class WeixinOCAdapter(Platform):
             logger.debug("weixin_oc: skip message with empty from_user_id.")
             return
 
+        self._last_activity_ts = time.time()
+        self._last_active_user_id = from_user_id
+
         context_token = str(msg.get("context_token", "")).strip()
         if context_token:
             self._context_tokens[from_user_id] = context_token
@@ -1530,6 +1626,11 @@ class WeixinOCAdapter(Platform):
             token_required=True,
             timeout_ms=self.long_poll_timeout_ms,
         )
+        ret = int(data.get("ret") or 0)
+        errcode = int(data.get("errcode", 0) or 0)
+        if self._is_session_expired(ret, errcode):
+            await self._handle_session_expired()
+            return
         if not self._is_successful_api_payload(data):
             self._last_inbound_error = self._format_api_error(data)
             logger.warning(
@@ -1667,6 +1768,15 @@ class WeixinOCAdapter(Platform):
                         await asyncio.sleep(self.qr_poll_interval)
                     continue
 
+                if (
+                    self._session_keepalive_task is None
+                    or self._session_keepalive_task.done()
+                ):
+                    self._last_activity_ts = time.time()
+                    self._session_keepalive_task = asyncio.create_task(
+                        self._session_keepalive_loop()
+                    )
+
                 try:
                     await self._poll_inbound_updates()
                 except asyncio.TimeoutError:
@@ -1686,11 +1796,23 @@ class WeixinOCAdapter(Platform):
         except Exception as e:
             logger.exception("weixin_oc(%s): run failed: %s", self.meta().id, e)
         finally:
+            await self._cancel_task_safely(
+                self._session_keepalive_task,
+                log_message="weixin_oc(%s): keepalive task cleanup error",
+                log_args=(self.meta().id,),
+            )
+            self._session_keepalive_task = None
             await self._cleanup_typing_tasks()
             await self.client.close()
 
     async def terminate(self) -> None:
         self._shutdown_event.set()
+        await self._cancel_task_safely(
+            self._session_keepalive_task,
+            log_message="weixin_oc(%s): keepalive task terminate error",
+            log_args=(self.meta().id,),
+        )
+        self._session_keepalive_task = None
         await self._cleanup_typing_tasks()
 
     def get_stats(self) -> dict:
@@ -1709,5 +1831,12 @@ class WeixinOCAdapter(Platform):
             "qr_error": login_session.error if login_session else None,
             "sync_buf_len": len(self._sync_buf),
             "last_error": self._last_inbound_error,
+            "last_activity_ts": self._last_activity_ts,
+            "idle_hours": round((time.time() - self._last_activity_ts) / 3600, 1),
+            "keepalive_threshold_h": self._session_keepalive_threshold_h,
+            "keepalive_running": (
+                self._session_keepalive_task is not None
+                and not self._session_keepalive_task.done()
+            ),
         }
         return stat

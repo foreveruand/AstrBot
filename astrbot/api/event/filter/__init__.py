@@ -9,10 +9,10 @@ from astrbot.core.star.filter.platform_adapter_type import (
     PlatformAdapterTypeFilter,
 )
 from astrbot.core.star.register import register_after_message_sent as after_message_sent
+from astrbot.core.star.register import register_callback_query as callback_query
 from astrbot.core.star.register import (
     register_chosen_inline_result as chosen_inline_result,
 )
-from astrbot.core.star.register import register_callback_query as callback_query
 from astrbot.core.star.register import register_command as command
 from astrbot.core.star.register import register_command_group as command_group
 from astrbot.core.star.register import register_custom_filter as custom_filter
