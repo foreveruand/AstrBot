@@ -131,6 +131,8 @@ class RespondStage(Stage):
         """检查是否需要分段回复"""
         if not self.enable_seg:
             return False
+        if hasattr(event, "inline_query_id"):
+            return False
 
         if (result := event.get_result()) is None:
             return False
@@ -241,14 +243,21 @@ class RespondStage(Stage):
                         f"实际消息链为空, 跳过发送阶段。header_chain: {header_comps}, actual_chain: {result.chain}",
                     )
                     return
-                for comp in result.chain:
+                comps_list = list(result.chain)
+                for idx, comp in enumerate(comps_list):
                     i = await self._calc_comp_interval(comp)
                     await asyncio.sleep(i)
+                    is_last = idx == len(comps_list) - 1
                     try:
                         if comp.type in need_separately:
                             await event.send(MessageChain([comp]))
                         else:
-                            await event.send(MessageChain([*header_comps, comp]))
+                            reply_markup = result.reply_markup if is_last else None
+                            await event.send(
+                                MessageChain(
+                                    [*header_comps, comp], reply_markup=reply_markup
+                                )
+                            )
                             header_comps.clear()
                     except Exception as e:
                         logger.error(
@@ -279,13 +288,14 @@ class RespondStage(Stage):
                             f"发送消息链失败: chain = {chain}, error = {e}",
                             exc_info=True,
                         )
-                chain = MessageChain(result.chain)
                 if result.chain and len(result.chain) > 0:
                     try:
-                        await event.send(chain)
+                        await event.send(
+                            MessageChain(result.chain, reply_markup=result.reply_markup)
+                        )
                     except Exception as e:
                         logger.error(
-                            f"发送消息链失败: chain = {chain}, error = {e}",
+                            f"发送消息链失败: chain = {result.chain}, error = {e}",
                             exc_info=True,
                         )
 

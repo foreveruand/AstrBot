@@ -476,6 +476,21 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
         else:
             yield await self.provider.text_chat(**payload)
 
+    @staticmethod
+    def _build_partial_stream_response(
+        streamed_completion_chunks: list[str],
+        streamed_reasoning_chunks: list[str],
+    ) -> LLMResponse | None:
+        completion_text = "".join(streamed_completion_chunks)
+        reasoning_content = "".join(streamed_reasoning_chunks)
+        if not completion_text.strip() and not reasoning_content.strip():
+            return None
+        return LLMResponse(
+            role="assistant",
+            completion_text=completion_text,
+            reasoning_content=reasoning_content,
+        )
+
     async def _iter_llm_responses_with_fallback(
         self,
     ) -> T.AsyncGenerator[LLMResponse, None]:
@@ -509,12 +524,22 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
 
                 async for attempt in retrying:
                     has_stream_output = False
+                    streamed_completion_chunks: list[str] = []
+                    streamed_reasoning_chunks: list[str] = []
                     with attempt:
                         try:
                             async for resp in self._iter_llm_responses(
                                 include_model=idx == 0
                             ):
                                 if resp.is_chunk:
+                                    if resp.completion_text:
+                                        streamed_completion_chunks.append(
+                                            resp.completion_text
+                                        )
+                                    if resp.reasoning_content:
+                                        streamed_reasoning_chunks.append(
+                                            resp.reasoning_content
+                                        )
                                     has_stream_output = True
                                     yield resp
                                     continue
@@ -535,13 +560,26 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                                 return
 
                             if has_stream_output:
+                                partial_resp = self._build_partial_stream_response(
+                                    streamed_completion_chunks,
+                                    streamed_reasoning_chunks,
+                                )
+                                if partial_resp is not None:
+                                    yield partial_resp
                                 return
                         except EmptyModelOutputError:
                             if has_stream_output:
                                 logger.warning(
-                                    "Chat Model %s returned empty output after streaming started; skipping empty-output retry.",
+                                    "Chat Model %s returned empty output after streaming started; keeping the partial streamed response and skipping retry/fallback.",
                                     candidate_id,
                                 )
+                                partial_resp = self._build_partial_stream_response(
+                                    streamed_completion_chunks,
+                                    streamed_reasoning_chunks,
+                                )
+                                if partial_resp is not None:
+                                    yield partial_resp
+                                    return
                             else:
                                 logger.warning(
                                     "Chat Model %s returned empty output on attempt %s/%s.",
@@ -874,16 +912,7 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                 return
 
             # 将结果添加到上下文中
-            parts = []
-            if llm_resp.reasoning_content or llm_resp.reasoning_signature:
-                parts.append(
-                    ThinkPart(
-                        think=llm_resp.reasoning_content,
-                        encrypted=llm_resp.reasoning_signature,
-                    )
-                )
-            if llm_resp.completion_text:
-                parts.append(TextPart(text=llm_resp.completion_text))
+            parts = llm_resp.build_assistant_message_parts()
             if len(parts) == 0:
                 parts = None
             tool_calls_result = ToolCallsResult(
@@ -1359,16 +1388,7 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
         self._transition_state(AgentState.DONE)
         self.stats.end_time = time.time()
 
-        parts = []
-        if llm_resp.reasoning_content or llm_resp.reasoning_signature:
-            parts.append(
-                ThinkPart(
-                    think=llm_resp.reasoning_content,
-                    encrypted=llm_resp.reasoning_signature,
-                )
-            )
-        if llm_resp.completion_text:
-            parts.append(TextPart(text=llm_resp.completion_text))
+        parts = llm_resp.build_assistant_message_parts()
         if parts:
             self.run_context.messages.append(Message(role="assistant", content=parts))
 

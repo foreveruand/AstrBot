@@ -3,6 +3,7 @@ import traceback
 from quart import request
 
 from astrbot.core import logger
+from astrbot.core.agent.handoff import HandoffTool
 from astrbot.core.agent.mcp_client import MCPTool, validate_mcp_stdio_config
 from astrbot.core.core_lifecycle import AstrBotCoreLifecycle
 from astrbot.core.star import star_map
@@ -449,6 +450,16 @@ class ToolsRoute(Route):
             for tool in self.tool_mgr.iter_builtin_tools():
                 if tool.name not in existing_names:
                     tools.append(tool)
+                    existing_names.add(tool.name)
+
+            subagent_orchestrator = getattr(
+                self.core_lifecycle, "subagent_orchestrator", None
+            )
+            if subagent_orchestrator:
+                for tool in subagent_orchestrator.handoffs:
+                    if tool.name not in existing_names:
+                        tools.append(tool)
+                        existing_names.add(tool.name)
 
             conf_list = self.core_lifecycle.astrbot_config_mgr.get_conf_list()
             conf_name_map = {conf["id"]: conf["name"] for conf in conf_list}
@@ -480,6 +491,9 @@ class ToolsRoute(Route):
                         for status in builtin_config_statuses
                         if status["enabled"]
                     ]
+                elif isinstance(tool, HandoffTool):
+                    origin = "subagent"
+                    origin_name = tool.agent.name
                 elif isinstance(tool, MCPTool):
                     origin = "mcp"
                     origin_name = tool.mcp_server_name
