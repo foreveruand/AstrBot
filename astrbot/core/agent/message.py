@@ -124,6 +124,24 @@ class AudioURLPart(ContentPart):
     audio_url: AudioURL
 
 
+class GeminiToolCallPart(ContentPart):
+    """A Gemini server-side tool call part."""
+
+    type: str = "tool_call"
+    id: str
+    tool_type: str
+    args: dict[str, Any] | None = None
+
+
+class GeminiToolResponsePart(ContentPart):
+    """A Gemini server-side tool response part."""
+
+    type: str = "tool_response"
+    id: str
+    tool_type: str
+    response: dict[str, Any] | None = None
+
+
 class ToolCall(BaseModel):
     """
     A tool call requested by the assistant.

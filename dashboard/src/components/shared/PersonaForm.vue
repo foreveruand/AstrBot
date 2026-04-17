@@ -530,8 +530,8 @@ export default {
                 system_prompt: '',
                 custom_error_message: '',
                 begin_dialogs: [],
-                tools: [],
-                skills: [],
+                tools: null,
+                skills: null,
                 folder_id: this.currentFolderId
             };
             this.toolSelectValue = '0';

@@ -357,6 +357,8 @@ class LLMResponse:
     """The reasoning content extracted from the LLM, if any."""
     reasoning_signature: str | None = None
     """The signature of the reasoning content, if any."""
+    assistant_content_parts: list[ContentPart] = field(default_factory=list)
+    """Structured assistant content parts kept for history serialization."""
 
     raw_completion: (
         ChatCompletion | GenerateContentResponse | AnthropicMessage | None
@@ -385,6 +387,7 @@ class LLMResponse:
         tools_call_extra_content: dict[str, dict[str, Any]] | None = None,
         reasoning_content: str | None = None,
         reasoning_signature: str | None = None,
+        assistant_content_parts: list[ContentPart] | None = None,
         raw_completion: ChatCompletion
         | GenerateContentResponse
         | AnthropicMessage
@@ -412,6 +415,8 @@ class LLMResponse:
             tools_call_ids = []
         if tools_call_extra_content is None:
             tools_call_extra_content = {}
+        if assistant_content_parts is None:
+            assistant_content_parts = []
 
         self.role = role
         self.completion_text = completion_text
@@ -422,6 +427,7 @@ class LLMResponse:
         self.tools_call_extra_content = tools_call_extra_content
         self.reasoning_content = reasoning_content
         self.reasoning_signature = reasoning_signature
+        self.assistant_content_parts = assistant_content_parts
         self.raw_completion = raw_completion
         self.is_chunk = is_chunk
 
@@ -485,6 +491,27 @@ class LLMResponse:
                 ),
             )
         return ret
+
+    def build_assistant_message_parts(self) -> list[ContentPart]:
+        """Build assistant content parts for history serialization."""
+        if self.assistant_content_parts:
+            return list(self.assistant_content_parts)
+
+        parts: list[ContentPart] = []
+        if self.reasoning_content is not None or self.reasoning_signature:
+            from astrbot.core.agent.message import ThinkPart
+
+            parts.append(
+                ThinkPart(
+                    think=self.reasoning_content or "",
+                    encrypted=self.reasoning_signature,
+                )
+            )
+        if self.completion_text:
+            from astrbot.core.agent.message import TextPart
+
+            parts.append(TextPart(text=self.completion_text))
+        return parts
 
 
 @dataclass

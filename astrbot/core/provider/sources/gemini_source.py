@@ -16,7 +16,15 @@ from google.genai.errors import APIError
 import astrbot.core.message.components as Comp
 from astrbot import logger
 from astrbot.api.provider import Provider
-from astrbot.core.agent.message import AudioURLPart, ContentPart, ImageURLPart, TextPart
+from astrbot.core.agent.message import (
+    AudioURLPart,
+    ContentPart,
+    GeminiToolCallPart,
+    GeminiToolResponsePart,
+    ImageURLPart,
+    TextPart,
+    ThinkPart,
+)
 from astrbot.core.exceptions import EmptyModelOutputError
 from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.provider.entities import LLMResponse, TokenUsage
@@ -154,15 +162,22 @@ class ProviderGoogleGenAI(Provider):
             logger.warning("流式输出不支持图片模态，已自动降级为文本模态")
             modalities = ["TEXT"]
 
-        tool_list: list[types.Tool] | None = []
         model_name = cast(str, payloads.get("model", self.get_model()))
         native_coderunner = self.provider_config.get("gm_native_coderunner", False)
         native_search = self.provider_config.get("gm_native_search", False)
         url_context = self.provider_config.get("gm_url_context", False)
+        supports_tool_combination = "gemini-3" in model_name
+        tool_config_fields = getattr(types.ToolConfig, "model_fields", {})
+        supports_server_side_tool_invocations = (
+            "include_server_side_tool_invocations" in tool_config_fields
+        )
+
+        builtin_tool_payload: dict[str, object] = {}
+        tool_config = None
 
         if "gemini-2.5" in model_name:
             if native_coderunner:
-                tool_list.append(types.Tool(code_execution=types.ToolCodeExecution()))
+                builtin_tool_payload["code_execution"] = types.ToolCodeExecution()
                 if native_search:
                     logger.warning("代码执行工具与搜索工具互斥，已忽略搜索工具")
                 if url_context:
@@ -171,11 +186,11 @@ class ProviderGoogleGenAI(Provider):
                     )
             else:
                 if native_search:
-                    tool_list.append(types.Tool(google_search=types.GoogleSearch()))
+                    builtin_tool_payload["google_search"] = types.GoogleSearch()
 
                 if url_context:
                     if hasattr(types, "UrlContext"):
-                        tool_list.append(types.Tool(url_context=types.UrlContext()))
+                        builtin_tool_payload["url_context"] = types.UrlContext()
                     else:
                         logger.warning(
                             "当前 SDK 版本不支持 URL 上下文工具，已忽略该设置，请升级 google-genai 包",
@@ -190,42 +205,80 @@ class ProviderGoogleGenAI(Provider):
 
         else:
             if native_coderunner:
-                tool_list.append(types.Tool(code_execution=types.ToolCodeExecution()))
+                builtin_tool_payload["code_execution"] = types.ToolCodeExecution()
                 if native_search:
                     logger.warning("代码执行工具与搜索工具互斥，已忽略搜索工具")
             elif native_search:
-                tool_list.append(types.Tool(google_search=types.GoogleSearch()))
+                builtin_tool_payload["google_search"] = types.GoogleSearch()
 
             if url_context and not native_coderunner:
                 if hasattr(types, "UrlContext"):
-                    tool_list.append(types.Tool(url_context=types.UrlContext()))
+                    builtin_tool_payload["url_context"] = types.UrlContext()
                 else:
                     logger.warning(
                         "当前 SDK 版本不支持 URL 上下文工具，已忽略该设置，请升级 google-genai 包",
                     )
 
-        if not tool_list:
-            tool_list = None
+        has_builtin_tools = bool(builtin_tool_payload)
+        function_declarations = None
+        if tools and (func_desc := tools.google_schema()):
+            function_declarations = func_desc["function_declarations"]
 
-        if tools and tool_list:
-            logger.warning("已启用原生工具，函数工具将被忽略")
-        elif tools and (func_desc := tools.get_func_desc_google_genai_style()):
+        tool_list: list[types.Tool] | None = None
+        # Track whether function_declarations were actually included in tool_list.
+        # function_calling_config must only be sent when function declarations are present.
+        function_declarations_in_tool_list = False
+        if has_builtin_tools and function_declarations:
+            if supports_tool_combination:
+                tool_list = [
+                    types.Tool(
+                        **builtin_tool_payload,
+                        function_declarations=function_declarations,
+                    )
+                ]
+                function_declarations_in_tool_list = True
+                if supports_server_side_tool_invocations:
+                    tool_config = types.ToolConfig(
+                        include_server_side_tool_invocations=True,
+                    )
+                else:
+                    logger.warning(
+                        "当前 google-genai SDK 不支持 include_server_side_tool_invocations，"
+                        "Gemini 内置工具与函数工具组合将降级为无服务端工具历史回流。",
+                    )
+            else:
+                logger.warning(
+                    "当前 Gemini 模型不支持内置工具与函数工具组合调用，函数工具将被忽略",
+                )
+                tool_list = [types.Tool(**builtin_tool_payload)]
+                # function_declarations_in_tool_list stays False — do NOT send function_calling_config
+        elif has_builtin_tools:
+            tool_list = [types.Tool(**builtin_tool_payload)]
+        elif function_declarations:
             tool_list = [
-                types.Tool(function_declarations=func_desc["function_declarations"]),
+                types.Tool(function_declarations=function_declarations),
             ]
+            function_declarations_in_tool_list = True
 
-        tool_config = None
-        has_func_decl = tool_list and any(t.function_declarations for t in tool_list)
-        if has_func_decl:
-            tool_config = types.ToolConfig(
-                function_calling_config=types.FunctionCallingConfig(
+        if function_declarations_in_tool_list and tool_list:
+            tool_config_kwargs: dict[str, object] = {
+                "function_calling_config": types.FunctionCallingConfig(
                     mode=(
                         types.FunctionCallingConfigMode.ANY
                         if tool_choice == "required"
                         else types.FunctionCallingConfigMode.AUTO
                     )
+                ),
+            }
+            if (
+                supports_server_side_tool_invocations
+                and tool_config is not None
+                and tool_config.include_server_side_tool_invocations is not None
+            ):
+                tool_config_kwargs["include_server_side_tool_invocations"] = (
+                    tool_config.include_server_side_tool_invocations
                 )
-            )
+            tool_config = types.ToolConfig(**tool_config_kwargs)
 
         # oper thinking config
         thinking_config = None
@@ -328,12 +381,7 @@ class ProviderGoogleGenAI(Provider):
                 contents.append(content_cls(parts=part))
 
         gemini_contents: list[types.Content] = []
-        native_tool_enabled = any(
-            [
-                self.provider_config.get("gm_native_coderunner", False),
-                self.provider_config.get("gm_native_search", False),
-            ],
-        )
+        tool_call_name_map: dict[str, str] = {}
         for message in payloads["messages"]:
             role, content = message["role"], message.get("content")
 
@@ -356,42 +404,73 @@ class ProviderGoogleGenAI(Provider):
                 append_or_extend(gemini_contents, parts, types.UserContent)
 
             elif role == "assistant":
+                parts = []
                 if isinstance(content, str):
-                    parts = [types.Part.from_text(text=content)]
-                    append_or_extend(gemini_contents, parts, types.ModelContent)
+                    parts.append(types.Part.from_text(text=content))
                 elif isinstance(content, list):
-                    parts = []
-                    thinking_signature = None
-                    text = ""
                     for part in content:
-                        # for most cases, assistant content only contains two parts: think and text
-                        if part.get("type") == "think":
-                            thinking_signature = part.get("encrypted") or None
-                        else:
-                            text += str(part.get("text"))
-
-                    if thinking_signature and isinstance(thinking_signature, str):
-                        try:
-                            thinking_signature = base64.b64decode(thinking_signature)
-                        except Exception as e:
-                            logger.warning(
-                                f"Failed to decode google gemini thinking signature: {e}",
-                                exc_info=True,
+                        part_type = part.get("type")
+                        if part_type == "text":
+                            parts.append(
+                                types.Part.from_text(text=str(part.get("text") or " "))
                             )
-                            thinking_signature = None
-                    parts.append(
-                        types.Part(
-                            text=text,
-                            thought_signature=thinking_signature,
-                        )
-                    )
-                    append_or_extend(gemini_contents, parts, types.ModelContent)
+                        elif part_type == "think":
+                            thinking_signature = part.get("encrypted") or None
+                            if thinking_signature and isinstance(
+                                thinking_signature, str
+                            ):
+                                try:
+                                    thinking_signature = base64.b64decode(
+                                        thinking_signature
+                                    )
+                                except Exception as e:
+                                    logger.warning(
+                                        f"Failed to decode google gemini thinking signature: {e}",
+                                        exc_info=True,
+                                    )
+                                    thinking_signature = None
+                            parts.append(
+                                types.Part(
+                                    text=str(part.get("think") or ""),
+                                    thought=True,
+                                    thought_signature=thinking_signature,
+                                )
+                            )
+                        elif part_type == "tool_call":
+                            tool_type = part.get("tool_type")
+                            if not tool_type:
+                                continue
+                            parts.append(
+                                types.Part(
+                                    tool_call=types.ToolCall(
+                                        id=part.get("id"),
+                                        tool_type=types.ToolType(tool_type),
+                                        args=part.get("args"),
+                                    )
+                                )
+                            )
+                        elif part_type == "tool_response":
+                            tool_type = part.get("tool_type")
+                            if not tool_type:
+                                continue
+                            parts.append(
+                                types.Part(
+                                    tool_response=types.ToolResponse(
+                                        id=part.get("id"),
+                                        tool_type=types.ToolType(tool_type),
+                                        response=part.get("response"),
+                                    )
+                                )
+                            )
 
-                elif not native_tool_enabled and "tool_calls" in message:
-                    parts = []
+                if message.get("tool_calls"):
                     for tool in message["tool_calls"]:
+                        tool_name = tool["function"]["name"]
+                        tool_call_id = tool.get("id")
+                        if tool_call_id:
+                            tool_call_name_map[tool_call_id] = tool_name
                         part = types.Part.from_function_call(
-                            name=tool["function"]["name"],
+                            name=tool_name,
                             args=json.loads(tool["function"]["arguments"]),
                         )
                         # we should set thought_signature back to part if exists
@@ -405,26 +484,39 @@ class ProviderGoogleGenAI(Provider):
                             )
                             if ts_bs64:
                                 part.thought_signature = base64.b64decode(ts_bs64)
+                        if part.function_call and tool_call_id:
+                            part.function_call.id = tool_call_id
                         parts.append(part)
+
+                if parts:
                     append_or_extend(gemini_contents, parts, types.ModelContent)
                 else:
                     logger.warning("assistant 角色的消息内容为空，已添加空格占位")
-                    if native_tool_enabled and "tool_calls" in message:
-                        logger.warning(
-                            "检测到启用Gemini原生工具，且上下文中存在函数调用，建议使用 /reset 重置上下文",
-                        )
                     parts = [types.Part.from_text(text=" ")]
                     append_or_extend(gemini_contents, parts, types.ModelContent)
 
-            elif role == "tool" and not native_tool_enabled:
-                func_name = message.get("name", message["tool_call_id"])
+            elif role == "tool":
+                tool_call_id = message["tool_call_id"]
+                func_name = message.get("name") or tool_call_name_map.get(tool_call_id)
+                if not func_name:
+                    logger.warning(
+                        "Gemini tool response missing function name for tool_call_id=%s; "
+                        "falling back to tool_call_id",
+                        tool_call_id,
+                    )
+                    func_name = tool_call_id
+                response_payload: dict[str, object]
+                try:
+                    parsed_content = json.loads(message["content"])
+                except (TypeError, json.JSONDecodeError):
+                    parsed_content = message["content"]
+                response_payload = {"result": parsed_content}
                 part = types.Part.from_function_response(
                     name=func_name,
-                    response={
-                        "name": func_name,
-                        "content": message["content"],
-                    },
+                    response=response_payload,
                 )
+                if part.function_response:
+                    part.function_response.id = tool_call_id
 
                 parts = [part]
                 append_or_extend(gemini_contents, parts, types.UserContent)
@@ -523,6 +615,7 @@ class ProviderGoogleGenAI(Provider):
             llm_response.reasoning_content = reasoning
 
         chain = []
+        assistant_content_parts: list[ContentPart] = []
         part: types.Part
 
         # 暂时这样Fallback
@@ -540,6 +633,18 @@ class ProviderGoogleGenAI(Provider):
             # which also causes duplicate/triple replies on some platforms.
             if part.text and not part.thought:
                 chain.append(Comp.Plain(part.text))
+                assistant_content_parts.append(TextPart(text=part.text))
+            elif part.text and part.thought:
+                assistant_content_parts.append(
+                    ThinkPart(
+                        think=part.text,
+                        encrypted=(
+                            base64.b64encode(part.thought_signature).decode("utf-8")
+                            if part.thought_signature
+                            else None
+                        ),
+                    )
+                )
 
             if (
                 part.function_call
@@ -567,9 +672,30 @@ class ProviderGoogleGenAI(Provider):
             ):
                 chain.append(Comp.Image.fromBytes(part.inline_data.data))
 
+            tool_call = getattr(part, "tool_call", None)
+            if tool_call and tool_call.tool_type:
+                assistant_content_parts.append(
+                    GeminiToolCallPart(
+                        id=tool_call.id or "",
+                        tool_type=tool_call.tool_type.value,
+                        args=tool_call.args,
+                    )
+                )
+
+            tool_response = getattr(part, "tool_response", None)
+            if tool_response and tool_response.tool_type:
+                assistant_content_parts.append(
+                    GeminiToolResponsePart(
+                        id=tool_response.id or "",
+                        tool_type=tool_response.tool_type.value,
+                        response=tool_response.response,
+                    )
+                )
+
             if ts := part.thought_signature:
                 # only keep the last thinking signature
                 llm_response.reasoning_signature = base64.b64encode(ts).decode("utf-8")
+        llm_response.assistant_content_parts = assistant_content_parts
         chain_result = MessageChain(chain=chain)
         llm_response.result_chain = chain_result
         if validate_output:
@@ -755,18 +881,29 @@ class ProviderGoogleGenAI(Provider):
                 yield llm_response
 
             if chunk.candidates[0].finish_reason:
-                # Process the final chunk for potential tool calls or other content
+                # Process the final chunk for potential tool calls or other content.
+                # A chunk that contains function_call parts is caught by the early
+                # return above, so _process_content_parts here will never see tool
+                # calls.  It can still raise EmptyModelOutputError when the parts
+                # carry no usable content (e.g. only thinking / empty parts).  In
+                # that case we fall through so the post-loop code can assemble the
+                # final response from the already-accumulated text / reasoning.
                 if chunk.candidates[0].content.parts:
-                    final_response = LLMResponse("assistant", is_chunk=False)
-                    final_response.raw_completion = chunk
-                    final_response.result_chain = self._process_content_parts(
-                        chunk.candidates[0],
-                        final_response,
-                        validate_output=False,
-                    )
-                    final_response.id = chunk.response_id
-                    if chunk.usage_metadata:
-                        final_response.usage = self._extract_usage(chunk.usage_metadata)
+                    _fr = LLMResponse("assistant", is_chunk=False)
+                    _fr.raw_completion = chunk
+                    try:
+                        _fr.result_chain = self._process_content_parts(
+                            chunk.candidates[0],
+                            _fr,
+                        )
+                        _fr.id = chunk.response_id
+                        if chunk.usage_metadata:
+                            _fr.usage = self._extract_usage(chunk.usage_metadata)
+                        final_response = _fr
+                    except EmptyModelOutputError:
+                        # No usable content in the final chunk; accumulated_text
+                        # (collected from earlier delta chunks) will be used below.
+                        pass
                 break
 
         # Yield final complete response with accumulated text

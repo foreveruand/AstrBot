@@ -582,6 +582,21 @@ class WeixinOCAdapter(Platform):
         astrbot_config.save_config()
         self._context_tokens_dirty = False
 
+    @staticmethod
+    def _is_session_expired(ret: int, errcode: int) -> bool:
+        return ret == -14 or errcode == -14
+
+    async def _handle_session_expired(self) -> None:
+        logger.error(
+            "weixin_oc(%s): session expired, clearing token for re-login",
+            self.meta().id,
+        )
+        self.token = None
+        self.client.token = None
+        self._login_session = None
+        self._last_inbound_error = "session expired, need re-login"
+        await self._save_account_state()
+
     def _is_login_session_valid(
         self, login_session: OpenClawLoginSession | None
     ) -> bool:
@@ -1554,6 +1569,11 @@ class WeixinOCAdapter(Platform):
             token_required=True,
             timeout_ms=self.long_poll_timeout_ms,
         )
+        ret = int(data.get("ret") or 0)
+        errcode = int(data.get("errcode", 0) or 0)
+        if self._is_session_expired(ret, errcode):
+            await self._handle_session_expired()
+            return
         if not self._is_successful_api_payload(data):
             self._last_inbound_error = self._format_api_error(data)
             logger.warning(
