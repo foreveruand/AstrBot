@@ -26,7 +26,7 @@ from astrbot.core.star.star import StarMetadata, star_registry
 from astrbot.core.utils.astrbot_path import (
     get_astrbot_plugin_data_path,
 )
-from astrbot.core.utils.llm_metadata import LLM_METADATAS
+from astrbot.core.utils.llm_metadata import get_llm_metadata
 from astrbot.core.utils.totp import (
     TwoFactorCodeType,
     is_totp_enabled,
@@ -863,7 +863,7 @@ class ConfigRoute(Route):
 
             metadata_map = {}
             for model_id in models:
-                meta = LLM_METADATAS.get(model_id)
+                meta = get_llm_metadata(model_id)
                 if meta:
                     metadata_map[model_id] = meta
 
@@ -1024,7 +1024,7 @@ class ConfigRoute(Route):
 
             metadata_map = {}
             for model_id in models:
-                meta = LLM_METADATAS.get(model_id)
+                meta = get_llm_metadata(model_id)
                 if meta:
                     metadata_map[model_id] = meta
 
