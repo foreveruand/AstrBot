@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 import astrbot.api.message_components as Comp
+from astrbot.api.event import MessageChain
 from tests.fixtures.helpers import (
     NoopAwaitable,
     create_mock_file,
@@ -217,6 +218,150 @@ async def test_telegram_final_segment_splits_long_plaintext_when_markdown_fails(
     assert len(second_call["text"]) == 18
     assert "parse_mode" not in first_call
     assert "parse_mode" not in second_call
+
+
+@pytest.mark.asyncio
+async def test_telegram_send_with_client_batches_images_into_media_groups():
+    TelegramPlatformEvent = _load_telegram_platform_event()
+    client = MagicMock()
+    client.send_chat_action = AsyncMock()
+    client.send_media_group = AsyncMock()
+    client.send_photo = AsyncMock()
+    client.send_animation = AsyncMock()
+    client.send_message = AsyncMock()
+
+    message = MessageChain().message("A" * 1100)
+    for idx in range(11):
+        img = Comp.Image.fromURL(f"https://example.com/{idx}.jpg")
+        message.chain.append(img)
+
+    image_paths = [f"/tmp/{idx}.jpg" for idx in range(11)]
+    with (
+        patch.object(
+            Comp.Image,
+            "convert_to_file_path",
+            AsyncMock(side_effect=image_paths),
+        ),
+        patch(
+            "astrbot.core.platform.sources.telegram.tg_event.InputMediaPhoto",
+            new=MagicMock(),
+        ) as input_media_photo,
+    ):
+        await TelegramPlatformEvent.send_with_client(client, message, "123456")
+
+        assert client.send_media_group.await_count == 2
+        assert client.send_photo.await_count == 0
+
+        first_group = client.send_media_group.await_args_list[0].kwargs
+        second_group = client.send_media_group.await_args_list[1].kwargs
+        assert len(first_group["media"]) == 10
+        assert len(second_group["media"]) == 1
+        assert "caption" not in first_group
+        assert "parse_mode" not in first_group
+        assert "caption" not in second_group
+
+        assert input_media_photo.call_count == 11
+        first_photo_kwargs = input_media_photo.call_args_list[0].kwargs
+        second_batch_first_photo_kwargs = input_media_photo.call_args_list[10].kwargs
+        assert len(first_photo_kwargs["caption"]) == 1024
+        assert first_photo_kwargs["parse_mode"] == "MarkdownV2"
+        assert "caption" not in second_batch_first_photo_kwargs
+
+        assert client.send_message.await_count == 1
+        followup = client.send_message.await_args_list[0].kwargs
+        assert len(followup["text"]) == 76
+        assert followup["parse_mode"] == "MarkdownV2"
+
+
+@pytest.mark.asyncio
+async def test_telegram_send_with_client_single_image_keeps_send_photo():
+    TelegramPlatformEvent = _load_telegram_platform_event()
+    client = MagicMock()
+    client.send_chat_action = AsyncMock()
+    client.send_media_group = AsyncMock()
+    client.send_photo = AsyncMock()
+    client.send_animation = AsyncMock()
+    client.send_message = AsyncMock()
+
+    message = MessageChain().message("hello")
+    img = Comp.Image.fromURL("https://example.com/single.jpg")
+    message.chain.append(img)
+
+    with patch.object(
+        Comp.Image,
+        "convert_to_file_path",
+        AsyncMock(return_value="/tmp/single.jpg"),
+    ):
+        await TelegramPlatformEvent.send_with_client(client, message, "123456")
+
+    assert client.send_photo.await_count == 1
+    assert client.send_media_group.await_count == 0
+    assert client.send_message.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_telegram_send_with_client_single_image_falls_back_to_document_on_invalid_dimensions():
+    TelegramPlatformEvent = _load_telegram_platform_event()
+    client = MagicMock()
+    client.send_chat_action = AsyncMock()
+    client.send_media_group = AsyncMock()
+    client.send_photo = AsyncMock(side_effect=Exception("Photo_invalid_dimensions"))
+    client.send_document = AsyncMock()
+    client.send_animation = AsyncMock()
+    client.send_message = AsyncMock()
+
+    message = MessageChain().message("hello")
+    img = Comp.Image.fromURL("https://example.com/single.jpg")
+    message.chain.append(img)
+
+    with patch.object(
+        Comp.Image,
+        "convert_to_file_path",
+        AsyncMock(return_value="/tmp/single.jpg"),
+    ):
+        await TelegramPlatformEvent.send_with_client(client, message, "123456")
+
+    assert client.send_photo.await_count == 1
+    assert client.send_document.await_count == 1
+    document_kwargs = client.send_document.await_args.kwargs
+    assert document_kwargs["document"] == "/tmp/single.jpg"
+    assert document_kwargs["filename"] == "single.jpg"
+    assert document_kwargs["caption"] == "hello"
+    assert client.send_media_group.await_count == 0
+    assert client.send_message.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_telegram_send_with_client_fallbacks_to_single_photo_on_media_group_error():
+    TelegramPlatformEvent = _load_telegram_platform_event()
+    client = MagicMock()
+    client.send_chat_action = AsyncMock()
+    client.send_media_group = AsyncMock(side_effect=Exception("media group failed"))
+    client.send_photo = AsyncMock()
+    client.send_animation = AsyncMock()
+    client.send_message = AsyncMock()
+
+    message = MessageChain().message("hello")
+    for idx in range(2):
+        img = Comp.Image.fromURL(f"https://example.com/{idx}.jpg")
+        message.chain.append(img)
+
+    image_paths = ["/tmp/0.jpg", "/tmp/1.jpg"]
+    with (
+        patch.object(
+            Comp.Image,
+            "convert_to_file_path",
+            AsyncMock(side_effect=image_paths),
+        ),
+        patch(
+            "astrbot.core.platform.sources.telegram.tg_event.InputMediaPhoto",
+            new=MagicMock(),
+        ),
+    ):
+        await TelegramPlatformEvent.send_with_client(client, message, "123456")
+
+    assert client.send_media_group.await_count == 1
+    assert client.send_photo.await_count == 2
 
 
 @pytest.mark.asyncio

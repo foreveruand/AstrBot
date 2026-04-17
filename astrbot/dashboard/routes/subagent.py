@@ -5,6 +5,7 @@ from quart import jsonify, request
 from astrbot.core import logger
 from astrbot.core.agent.handoff import HandoffTool
 from astrbot.core.core_lifecycle import AstrBotCoreLifecycle
+from astrbot.core.subagent_orchestrator import HANDOFF_HANDLER_MODULE_PATH
 
 from .route import Response, Route, RouteContext
 
@@ -100,7 +101,7 @@ class SubAgentRoute(Route):
                 # the handoff (transfer_to_*) tools as their own mounted tools.
                 if isinstance(tool, HandoffTool):
                     continue
-                if tool.handler_module_path == "core.subagent_orchestrator":
+                if tool.handler_module_path == HANDOFF_HANDLER_MODULE_PATH:
                     continue
                 tools_dict.append(
                     {

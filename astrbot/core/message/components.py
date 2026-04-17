@@ -397,9 +397,11 @@ class Image(BaseMessageComponent):
     url: str | None = ""
     # 额外
     path: str | None = ""
+    file_unique: str | None = ""  # 某些平台可能有图片缓存的唯一标识
+    use_spoiler: bool = False  # Telegram 平台支持剧透图片（模糊显示）
 
-    def __init__(self, file: str | None, **_) -> None:
-        super().__init__(file=file, **_)
+    def __init__(self, file: str | None, use_spoiler: bool = False, **_) -> None:
+        super().__init__(file=file, use_spoiler=use_spoiler, **_)
 
     @staticmethod
     def fromURL(url: str, **_):
