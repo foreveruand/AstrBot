@@ -32,9 +32,17 @@ class CronJobSchedulingError(Exception):
 class CronJobManager:
     """Central scheduler for BasicCronJob and ActiveAgentCronJob."""
 
-    def __init__(self, db: BaseDatabase) -> None:
+    DEFAULT_RUNNING_TIMEOUT = 1800
+
+    def __init__(
+        self,
+        db: BaseDatabase,
+        *,
+        running_timeout: int = DEFAULT_RUNNING_TIMEOUT,
+    ) -> None:
         self.db = db
         self.scheduler = AsyncIOScheduler()
+        self.running_timeout = running_timeout
         self._basic_handlers: dict[str, Callable[..., Any]] = {}
         self._lock = asyncio.Lock()
         self._started = False
@@ -185,6 +193,7 @@ class CronJobManager:
                 args=[job.job_id],
                 replace_existing=True,
                 misfire_grace_time=30,
+                max_instances=1,
             )
             asyncio.create_task(
                 self.db.update_cron_job(
@@ -222,11 +231,24 @@ class CronJobManager:
         last_error = None
         try:
             if job.job_type == "basic":
-                await self._run_basic_job(job)
+                await asyncio.wait_for(
+                    self._run_basic_job(job), timeout=self.running_timeout
+                )
             elif job.job_type == "active_agent":
-                await self._run_active_agent_job(job, start_time=start_time)
+                await asyncio.wait_for(
+                    self._run_active_agent_job(job, start_time=start_time),
+                    timeout=self.running_timeout,
+                )
             else:
                 raise ValueError(f"Unknown cron job type: {job.job_type}")
+        except TimeoutError:
+            status = "failed"
+            last_error = f"Cron job exceeded timeout of {self.running_timeout} seconds."
+            logger.error(
+                "Cron job %s timed out after %s seconds.",
+                job_id,
+                self.running_timeout,
+            )
         except Exception as e:  # noqa: BLE001
             status = "failed"
             last_error = str(e)
