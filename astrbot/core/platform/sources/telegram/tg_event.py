@@ -275,9 +275,13 @@ class TelegramPlatformEvent(AstrMessageEvent):
                 )
 
     @classmethod
-    def _is_photo_invalid_dimensions_error(cls, error: BadRequest) -> bool:
+    def _is_photo_recoverable_error(cls, error: BadRequest) -> bool:
         message = f"{getattr(error, 'message', '')} {error!s}".lower()
-        return "photo_invalid_dimensions" in message
+        return (
+            "photo_invalid_dimensions" in message
+            or "too big for a photo" in message
+            or "too big to send as a photo" in message
+        )
 
     @classmethod
     async def _send_photo_with_document_fallback(
@@ -291,7 +295,7 @@ class TelegramPlatformEvent(AstrMessageEvent):
         message_thread_id: str | None = None,
         use_media_action: bool = False,
     ) -> None:
-        """Send a Telegram photo, falling back to a document if dimensions are invalid."""
+        """Send a Telegram photo, falling back to a document if Telegram rejects it."""
         try:
             if use_media_action:
                 await cls._send_media_with_action(
@@ -307,11 +311,11 @@ class TelegramPlatformEvent(AstrMessageEvent):
                 await client.send_photo(**photo_kwargs, **cast(Any, payload))
             return
         except BadRequest as e:
-            if not cls._is_photo_invalid_dimensions_error(e):
+            if not cls._is_photo_recoverable_error(e):
                 raise
 
         logger.warning(
-            "Telegram rejected photo dimensions for %s, falling back to document",
+            "Telegram rejected photo send for %s, falling back to document",
             path,
         )
         document_payload = dict(payload)
