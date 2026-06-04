@@ -19,6 +19,7 @@ from astrbot.core.platform.sources.telegram.inline_registry import (
 from astrbot.core.platform.sources.telegram.tg_event import (
     TelegramCallbackQueryEvent,
     TelegramChosenInlineResultEvent,
+    TelegramGuestMessageEvent,
     TelegramInlineQueryEvent,
 )
 from astrbot.core.star.filter.command import CommandFilter
@@ -461,6 +462,20 @@ def _make_inline_query_event(client, query="tell me a joke"):
     )
 
 
+def _make_guest_event(client, query="guest question"):
+    return TelegramGuestMessageEvent(
+        query=query,
+        from_user_id="user1",
+        from_username="alice",
+        guest_query_id="gq-1",
+        message_id="msg-1",
+        platform_meta=PlatformMetadata("telegram", "telegram", "telegram"),
+        session_id="user1",
+        client=client,
+        self_id="test_bot",
+    )
+
+
 def _make_callback_event(client, data=TELEGRAM_INLINE_STOP_CALLBACK_DATA):
     return TelegramCallbackQueryEvent(
         callback_query_id="cb-1",
@@ -606,6 +621,45 @@ async def test_inline_option_placeholders_include_original_query_text():
     assert results[0].reply_markup.inline_keyboard[0][0].callback_data == (
         TELEGRAM_INLINE_STOP_CALLBACK_DATA
     )
+
+
+@pytest.mark.asyncio
+async def test_guest_message_event_answers_with_guest_query_result():
+    client = SimpleNamespace(_post=AsyncMock(), send_message=AsyncMock())
+    event = _make_guest_event(client)
+
+    await event.send_with_client(client, MessageChain().message("guest reply"), "user1")
+
+    client._post.assert_awaited_once()
+    endpoint = client._post.await_args.args[0]
+    payload = client._post.await_args.kwargs["data"]
+    assert endpoint == "answerGuestQuery"
+    assert payload["guest_query_id"] == "gq-1"
+    assert payload["cache_time"] == 0
+    assert payload["is_personal"] is True
+    assert payload["result"]["type"] == "article"
+    assert payload["result"]["input_message_content"]["message_text"] == "guest reply"
+    client.send_message.assert_not_awaited()
+    assert event.get_message_type() == MessageType.OTHER_MESSAGE
+    assert event.is_private_chat() is True
+
+
+@pytest.mark.asyncio
+async def test_guest_message_event_prefers_native_answer_guest_query():
+    client = SimpleNamespace(answer_guest_query=AsyncMock(), _post=AsyncMock())
+    event = _make_guest_event(client)
+
+    await event.send_with_client(
+        client, MessageChain().message("native reply"), "user1"
+    )
+
+    client.answer_guest_query.assert_awaited_once()
+    kwargs = client.answer_guest_query.await_args.kwargs
+    assert kwargs["guest_query_id"] == "gq-1"
+    assert kwargs["result"].input_message_content.message_text == "native reply"
+    assert kwargs["cache_time"] == 0
+    assert kwargs["is_personal"] is True
+    client._post.assert_not_awaited()
 
 
 @pytest.mark.asyncio

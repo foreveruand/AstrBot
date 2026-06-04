@@ -4,7 +4,8 @@ import re
 import sys
 import uuid
 from contextlib import suppress
-from typing import cast
+from types import SimpleNamespace
+from typing import Any, cast
 
 from apscheduler.events import EVENT_JOB_ERROR
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -18,6 +19,7 @@ from telegram.ext import (
     ContextTypes,
     ExtBot,
     InlineQueryHandler,
+    TypeHandler,
     filters,
 )
 from telegram.ext import MessageHandler as TelegramMessageHandler
@@ -45,6 +47,7 @@ from astrbot.core.utils.media_utils import convert_audio_to_wav
 from .tg_event import (
     TelegramCallbackQueryEvent,
     TelegramChosenInlineResultEvent,
+    TelegramGuestMessageEvent,
     TelegramInlineQueryEvent,
     TelegramPlatformEvent,
 )
@@ -150,6 +153,10 @@ class TelegramPlatformAdapter(Platform):
             .base_file_url(self.file_base_url)
             .build()
         )
+        self.application.add_handler(
+            TypeHandler(Update, callback=self.guest_message_handler),
+            group=-1,
+        )
         message_handler = TelegramMessageHandler(
             filters=filters.ALL,
             callback=self.message_handler,
@@ -174,7 +181,33 @@ class TelegramPlatformAdapter(Platform):
         if self.enable_command_register:
             await self.register_commands()
 
+        await self._log_guest_mode_status()
         self._application_started = True
+
+    async def _log_guest_mode_status(self) -> None:
+        try:
+            me = await self.client.get_me()
+        except Exception as e:
+            logger.debug(f"Failed to check Telegram guest mode status: {e!s}")
+            return
+
+        api_kwargs = getattr(me, "api_kwargs", None)
+        supports_guest_queries = getattr(me, "supports_guest_queries", None)
+        if supports_guest_queries is None and isinstance(api_kwargs, dict):
+            supports_guest_queries = api_kwargs.get("supports_guest_queries")
+
+        if supports_guest_queries is True:
+            logger.info("Telegram Guest Mode is enabled for this bot.")
+        elif supports_guest_queries is False:
+            logger.warning(
+                "Telegram Guest Mode is not enabled for this bot. Enable 'Guest Mode' "
+                "in BotFather's bot settings Mini App to receive guest_message updates."
+            )
+        else:
+            logger.info(
+                "Telegram Guest Mode capability is unknown. If guest_message updates "
+                "are not received, verify Guest Mode is enabled in BotFather."
+            )
 
     async def _shutdown_application(
         self,
@@ -230,6 +263,17 @@ class TelegramPlatformAdapter(Platform):
         )
         self.scheduler.start()
 
+    @staticmethod
+    def _allowed_updates() -> list[str]:
+        allowed_updates = []
+        for update_type in getattr(Update, "ALL_TYPES", []):
+            value = getattr(update_type, "value", update_type)
+            if value:
+                allowed_updates.append(str(value))
+        if "guest_message" not in allowed_updates:
+            allowed_updates.append("guest_message")
+        return allowed_updates
+
     @override
     async def send_by_session(
         self,
@@ -269,7 +313,15 @@ class TelegramPlatformAdapter(Platform):
                     await asyncio.sleep(self._polling_restart_delay)
                     continue
                 logger.info("Starting Telegram polling...")
-                await updater.start_polling(error_callback=self._on_polling_error)
+                allowed_updates = self._allowed_updates()
+                logger.info(
+                    "Telegram polling allowed updates: %s",
+                    ", ".join(allowed_updates),
+                )
+                await updater.start_polling(
+                    allowed_updates=allowed_updates,
+                    error_callback=self._on_polling_error,
+                )
                 logger.info("Telegram Platform Adapter is running.")
                 while updater.running and not self._terminating:  # noqa: ASYNC110
                     if self._polling_recovery_requested.is_set():
@@ -446,6 +498,9 @@ class TelegramPlatformAdapter(Platform):
     async def message_handler(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
+        if self._get_guest_message(update) is not None:
+            return
+
         logger.debug(f"Telegram message: {update.message}")
 
         # Handle media group messages
@@ -788,6 +843,73 @@ class TelegramPlatformAdapter(Platform):
             client=self.client,
         )
         self.commit_event(inline_query_event)
+
+    @staticmethod
+    def _dict_to_namespace(data: Any) -> Any:
+        if isinstance(data, dict):
+            return SimpleNamespace(
+                **{
+                    ("from_user" if key == "from" else key): (
+                        TelegramPlatformAdapter._dict_to_namespace(value)
+                    )
+                    for key, value in data.items()
+                },
+            )
+        if isinstance(data, list):
+            return [TelegramPlatformAdapter._dict_to_namespace(item) for item in data]
+        return data
+
+    @classmethod
+    def _get_guest_message(cls, update: Update) -> Any | None:
+        guest_message = getattr(update, "guest_message", None)
+        if guest_message is not None and getattr(guest_message, "guest_query_id", None):
+            return guest_message
+        api_kwargs = getattr(update, "api_kwargs", None)
+        if isinstance(api_kwargs, dict) and api_kwargs.get("guest_message"):
+            return cls._dict_to_namespace(api_kwargs["guest_message"])
+        return None
+
+    async def guest_message_handler(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """处理 Telegram Guest Mode 消息"""
+        api_kwargs = getattr(update, "api_kwargs", None)
+        if isinstance(api_kwargs, dict) and api_kwargs:
+            logger.debug(f"Telegram raw update api_kwargs keys: {list(api_kwargs)}")
+
+        guest_message = self._get_guest_message(update)
+        if not guest_message:
+            return
+
+        logger.info("Received Telegram guest_message update.")
+        guest_query_id = getattr(guest_message, "guest_query_id", None)
+        if not guest_query_id:
+            logger.warning("Received a guest message without guest_query_id.")
+            return
+
+        from_user = getattr(guest_message, "from_user", None)
+        if not from_user:
+            logger.warning("Received a guest message without from_user.")
+            return
+
+        query = (
+            getattr(guest_message, "text", None)
+            or getattr(guest_message, "caption", None)
+            or ""
+        )
+        guest_event = TelegramGuestMessageEvent(
+            query=str(query),
+            from_user_id=str(from_user.id),
+            from_username=getattr(from_user, "username", None),
+            guest_query_id=str(guest_query_id),
+            message_id=str(getattr(guest_message, "message_id", "")),
+            platform_meta=self.meta(),
+            session_id=str(from_user.id),
+            client=self.client,
+            raw_message=guest_message,
+            self_id=str(context.bot.username),
+        )
+        self.commit_event(guest_event)
 
     async def chosen_inline_result_handler(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE

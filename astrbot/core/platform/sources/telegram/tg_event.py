@@ -1351,6 +1351,201 @@ class TelegramInlineQueryEvent(AstrMessageEvent):
         await super().send_streaming(generator, use_fallback)
 
 
+class TelegramGuestMessageEvent(AstrMessageEvent):
+    """Telegram Guest Mode 消息事件"""
+
+    _GUEST_ARTICLE_PARAMS: set[str] | None = None
+
+    def __init__(
+        self,
+        query: str,
+        from_user_id: str,
+        from_username: str | None,
+        guest_query_id: str,
+        message_id: str,
+        platform_meta: PlatformMetadata,
+        session_id: str,
+        client: ExtBot,
+        raw_message: object | None = None,
+        self_id: str = "",
+    ) -> None:
+        self.query = query
+        self.from_user_id = from_user_id
+        self.from_username = from_username
+        self.guest_query_id = guest_query_id
+        self.client = client
+
+        from astrbot.api.platform import AstrBotMessage, MessageType
+
+        message_obj = AstrBotMessage()
+        message_obj.message = [Plain(query)] if query else []
+        message_obj.type = MessageType.OTHER_MESSAGE
+        message_obj.message_id = message_id
+        message_obj.session_id = session_id
+        message_obj.raw_message = raw_message
+        message_obj.message_str = query
+        message_obj.self_id = self_id
+        nickname = from_username or from_user_id
+        message_obj.sender = MessageMember(user_id=from_user_id, nickname=nickname)
+
+        super().__init__(
+            message_str=query,
+            message_obj=message_obj,
+            platform_meta=platform_meta,
+            session_id=session_id,
+        )
+
+        self.is_wake = True
+        self.is_at_or_wake_command = True
+
+    def get_sender_id(self) -> str:
+        return self.from_user_id
+
+    def get_sender_name(self) -> str:
+        return self.from_username or self.from_user_id
+
+    def get_message_type(self) -> MessageType:
+        return MessageType.OTHER_MESSAGE
+
+    def is_private_chat(self) -> bool:
+        return True
+
+    def _chain_to_text(self, message_chain: MessageChain) -> str:
+        text = message_chain.get_plain_text(with_other_comps_mark=True)
+        return text.strip()
+
+    @classmethod
+    def _get_article_params(cls) -> set[str]:
+        if cls._GUEST_ARTICLE_PARAMS is None:
+            try:
+                cls._GUEST_ARTICLE_PARAMS = set(
+                    inspect.signature(InlineQueryResultArticle).parameters.keys(),
+                )
+            except Exception:
+                cls._GUEST_ARTICLE_PARAMS = set()
+        return cls._GUEST_ARTICLE_PARAMS
+
+    def _build_guest_result(self, text: str) -> InlineQueryResultArticle | None:
+        if not text:
+            return None
+
+        chunk = TelegramPlatformEvent._split_message(text)[0]
+        raw_id = f"{self.guest_query_id}:{hashlib.blake2b(chunk.encode('utf-8'), digest_size=6).hexdigest()}"
+        result_id = (
+            f"abg-{hashlib.blake2b(raw_id.encode('utf-8'), digest_size=6).hexdigest()}"
+        )
+        description = chunk.replace("\n", " ").strip()
+        if len(description) > TelegramInlineQueryEvent.MAX_INLINE_DESCRIPTION_LEN:
+            description = (
+                description[: TelegramInlineQueryEvent.MAX_INLINE_DESCRIPTION_LEN - 1]
+                + "…"
+            )
+        kwargs = {
+            "id": result_id,
+            "title": "AstrBot",
+            "description": description,
+            "input_message_content": InputTextMessageContent(
+                message_text=chunk[: TelegramPlatformEvent.MAX_MESSAGE_LENGTH],
+            ),
+        }
+        thumb_url = "https://raw.githubusercontent.com/AstrBotDevs/AstrBot/7c39abc6b5ce0e61c10ed2d7c41a4079d771d6cf/dashboard/src/assets/images/astrbot_logo_mini.webp"
+        if thumb_url:
+            article_params = self._get_article_params()
+            if "thumb_url" in article_params:
+                kwargs["thumb_url"] = thumb_url
+            elif "thumbnail_url" in article_params:
+                kwargs["thumbnail_url"] = thumb_url
+        return InlineQueryResultArticle(**kwargs)
+
+    def _build_guest_result_payload(self, text: str) -> dict[str, Any] | None:
+        if not text:
+            return None
+
+        chunk = TelegramPlatformEvent._split_message(text)[0]
+        raw_id = f"{self.guest_query_id}:{hashlib.blake2b(chunk.encode('utf-8'), digest_size=6).hexdigest()}"
+        result_id = (
+            f"abg-{hashlib.blake2b(raw_id.encode('utf-8'), digest_size=6).hexdigest()}"
+        )
+        description = chunk.replace("\n", " ").strip()
+        if len(description) > TelegramInlineQueryEvent.MAX_INLINE_DESCRIPTION_LEN:
+            description = (
+                description[: TelegramInlineQueryEvent.MAX_INLINE_DESCRIPTION_LEN - 1]
+                + "…"
+            )
+        return {
+            "type": "article",
+            "id": result_id,
+            "title": "AstrBot",
+            "description": description,
+            "input_message_content": {
+                "message_text": chunk[: TelegramPlatformEvent.MAX_MESSAGE_LENGTH],
+            },
+        }
+
+    async def _answer_guest_query(self, text: str) -> None:
+        result_payload = self._build_guest_result_payload(text)
+        if result_payload is None:
+            logger.warning("TelegramGuestMessageEvent 消息为空，跳过响应。")
+            return
+
+        try:
+            answer_guest_query = getattr(self.client, "answer_guest_query", None)
+            if callable(answer_guest_query):
+                result = self._build_guest_result(text)
+                if result is None:
+                    return
+                await answer_guest_query(
+                    guest_query_id=self.guest_query_id,
+                    result=result,
+                    cache_time=0,
+                    is_personal=True,
+                )
+                return
+
+            post = getattr(self.client, "_post", None)
+            if not callable(post):
+                logger.warning("Telegram client does not support answerGuestQuery.")
+                return
+            await post(
+                "answerGuestQuery",
+                data={
+                    "guest_query_id": self.guest_query_id,
+                    "result": result_payload,
+                    "cache_time": 0,
+                    "is_personal": True,
+                },
+            )
+        except Exception as e:
+            logger.warning(f"answerGuestQuery 失败: {e!s}")
+
+    async def send_with_client(
+        self, client: ExtBot, message_chain: MessageChain, user_name: str
+    ) -> None:
+        _ = client
+        _ = user_name
+        text = self._chain_to_text(message_chain)
+        await self._answer_guest_query(text)
+
+    async def send(self, message: MessageChain) -> None:
+        await self.send_with_client(self.client, message, self.get_sender_id())
+        await super().send(message)
+
+    async def send_streaming(self, generator, use_fallback: bool = False):
+        delta = ""
+        async for chain in generator:
+            if not isinstance(chain, MessageChain):
+                continue
+            if chain.type == "break":
+                delta += "\n"
+                continue
+            delta += chain.get_plain_text(with_other_comps_mark=True)
+
+        if delta:
+            await self._answer_guest_query(delta)
+
+        await super().send_streaming(generator, use_fallback)
+
+
 class TelegramChosenInlineResultEvent(AstrMessageEvent):
     """Telegram 选择内联结果事件"""
 

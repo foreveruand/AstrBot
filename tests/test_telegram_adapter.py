@@ -81,6 +81,66 @@ def _build_context() -> MagicMock:
 
 
 @pytest.mark.asyncio
+async def test_telegram_guest_message_from_api_kwargs_commits_other_event():
+    TelegramPlatformAdapter = _load_telegram_adapter()
+    adapter = TelegramPlatformAdapter(
+        make_platform_config("telegram"),
+        {},
+        asyncio.Queue(),
+    )
+    update = MagicMock()
+    update.guest_message = None
+    update.api_kwargs = {
+        "guest_message": {
+            "message_id": 7,
+            "text": "guest question",
+            "guest_query_id": "gq-1",
+            "from": {
+                "id": 987654321,
+                "username": "guest_user",
+            },
+        }
+    }
+
+    with patch.object(adapter, "commit_event") as commit_event:
+        await adapter.guest_message_handler(update, _build_context())
+
+    commit_event.assert_called_once()
+    event = commit_event.call_args.args[0]
+    assert event.message_str == "guest question"
+    assert event.guest_query_id == "gq-1"
+    assert event.get_sender_id() == "987654321"
+    assert event.get_sender_name() == "guest_user"
+    assert event.get_message_type().value == "OtherMessage"
+    assert event.unified_msg_origin == "test_telegram:OtherMessage:987654321"
+
+
+@pytest.mark.asyncio
+async def test_telegram_message_handler_skips_guest_message_updates():
+    TelegramPlatformAdapter = _load_telegram_adapter()
+    adapter = TelegramPlatformAdapter(
+        make_platform_config("telegram"),
+        {},
+        asyncio.Queue(),
+    )
+    update = MagicMock()
+    update.guest_message = MagicMock()
+
+    with patch.object(adapter, "convert_message", AsyncMock()) as convert_message:
+        await adapter.message_handler(update, _build_context())
+
+    convert_message.assert_not_awaited()
+
+
+def test_telegram_allowed_updates_include_guest_message():
+    TelegramPlatformAdapter = _load_telegram_adapter()
+
+    allowed_updates = TelegramPlatformAdapter._allowed_updates()
+
+    assert "guest_message" in allowed_updates
+
+
+@pytest.mark.asyncio
 async def test_telegram_document_caption_populates_message_text_and_plain():
     TelegramPlatformAdapter = _load_telegram_adapter()
     adapter = TelegramPlatformAdapter(
