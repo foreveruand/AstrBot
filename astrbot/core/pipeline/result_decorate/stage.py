@@ -198,6 +198,7 @@ class ResultDecorateStage(Stage):
             return
 
         if len(result.chain) > 0:
+            is_chosen_inline_result = isinstance(getattr(event, "result_id", None), str)
             # 回复前缀
             if self.reply_prefix:
                 for comp in result.chain:
@@ -427,7 +428,7 @@ class ResultDecorateStage(Stage):
             can_decorate = all(
                 isinstance(item, (Plain, Image)) for item in result.chain
             )
-            if can_decorate:
+            if can_decorate and not is_chosen_inline_result:
                 # at 回复
                 if (
                     self.reply_with_mention

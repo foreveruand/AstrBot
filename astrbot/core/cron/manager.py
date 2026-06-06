@@ -478,15 +478,15 @@ class CronJobManager:
         persona_config = (
             cfg.get("agent_runner", {}).get("config", {}).get("persona", {})
         )
+        agent_runner_config = cfg.get("agent_runner", {}).get("config", {})
+        model_config = agent_runner_config.get("model", {})
         tool_call_timeout = (
-            cfg.get("agent_runner", {})
-            .get("config", {})
+            agent_runner_config
             .get("misc", {})
             .get("tool_call_timeout", 120)
         )
         agent_max_step = coerce_int_config(
-            cfg.get("agent_runner", {})
-            .get("config", {})
+            agent_runner_config
             .get("misc", {})
             .get("max_steps", 128),
             default=128,
@@ -495,10 +495,6 @@ class CronJobManager:
         )
         config = MainAgentBuildConfig(
             tool_call_timeout=tool_call_timeout,
-            fallback_provider_ids=cfg.get("agent_runner", {})
-            .get("config", {})
-            .get("model", {})
-            .get("fallback_provider_ids", []),
             **resolve_context_compression_config(
                 cfg.get("agent_runner", {}).get("config", {}).get("compression", {})
             ),
@@ -510,6 +506,8 @@ class CronJobManager:
             computer_use_runtime=provider_settings.get("computer_use_runtime", "none"),
             sandbox_cfg=provider_settings.get("sandbox", {}),
             provider_settings=provider_settings,
+            fallback_provider_ids=model_config.get("fallback_provider_ids", []),
+            request_max_retries=model_config.get("request_max_retries", 5),
         )
         req = ProviderRequest()
         conv = await _get_session_conv(event=cron_event, plugin_context=self.ctx)

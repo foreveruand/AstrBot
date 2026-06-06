@@ -44,6 +44,8 @@ Click the "Add SubAgent" button:
 
 After configuring the agents, click `Save` on the page.
 
+> Note: if a SubAgent has an explicit `Provider` override, it will use that `Provider` directly and will not use fallback providers. Fallback only applies when no `Provider` is specified, in which case AstrBot first uses the current conversation's Main Agent provider and falls back only on failure.
+
 ## Best Practices
 
 - **Single Responsibility**: Each SubAgent should handle one category of related tasks (e.g., search, file processing, smart home control).

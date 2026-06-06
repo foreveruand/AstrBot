@@ -5,6 +5,7 @@ import traceback
 from astrbot.core import logger
 from astrbot.core.agent.handoff import HandoffTool
 from astrbot.core.core_lifecycle import AstrBotCoreLifecycle
+from astrbot.core.subagent_orchestrator import HANDOFF_HANDLER_MODULE_PATH
 
 
 class SubAgentServiceError(Exception):
@@ -93,5 +94,5 @@ class SubAgentService:
     def _is_subagent_internal_tool(tool) -> bool:
         return (
             isinstance(tool, HandoffTool)
-            or tool.handler_module_path == "core.subagent_orchestrator"
+            or tool.handler_module_path == HANDOFF_HANDLER_MODULE_PATH
         )

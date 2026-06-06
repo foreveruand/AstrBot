@@ -44,6 +44,8 @@ SubAgent 编排是 AstrBot 提供的一种高级 Agent 组织方式。它允许�
 
 完成设置后，点击页面上的 `保存`。
 
+> 注意：如果子 Agent 显式指定了 `Provider`，它将直接使用该 `Provider`，不会再走 fallback。只有未指定 `Provider` 时，才会先使用主 Agent 当前会话的 `Provider`，失败后再尝试 fallback 列表。
+
 ## 最佳实践
 
 - **职责单一**：每个 SubAgent 应该只负责一类相关的任务（如：搜索、文件处理、智能家居控制）。
