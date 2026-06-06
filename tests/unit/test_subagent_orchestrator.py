@@ -108,3 +108,20 @@ async def test_reload_from_config_tool_normalization(raw_tools, expected_tools):
 
     handoff = orchestrator.handoffs[0]
     assert handoff.agent.tools == expected_tools
+
+
+@pytest.mark.asyncio
+async def test_reload_from_config_missing_persona_tools_is_empty():
+    tool_mgr = MagicMock()
+    persona_mgr = MagicMock()
+    persona_mgr.get_persona_v3_by_id.return_value = {
+        "name": "custom",
+        "prompt": "persona prompt",
+        "_begin_dialogs_processed": [],
+    }
+    orchestrator = SubAgentOrchestrator(tool_mgr=tool_mgr, persona_mgr=persona_mgr)
+
+    await orchestrator.reload_from_config(_build_cfg({"persona_id": "custom"}))
+
+    handoff = orchestrator.handoffs[0]
+    assert handoff.agent.tools == []

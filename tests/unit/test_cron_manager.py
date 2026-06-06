@@ -443,7 +443,9 @@ class TestScheduleJob:
         cron_manager._schedule_job(sample_cron_job)
 
         # Verify job was added to scheduler
-        assert cron_manager.scheduler.get_job("test-job-id") is not None
+        scheduled_job = cron_manager.scheduler.get_job("test-job-id")
+        assert scheduled_job is not None
+        assert scheduled_job.max_instances == 1
 
     @pytest.mark.asyncio
     async def test_schedule_job_uses_standard_crontab_weekday_numbers(
@@ -591,7 +593,7 @@ class TestRunActiveAgentJob:
     ):
         """Test active cron agent keeps structured history and provider settings."""
         provider_settings = {
-            "fallback_chat_models": ["fallback-provider"],
+            "streaming_response": False,
         }
         ctx = MagicMock()
         ctx.get_config.return_value = {
@@ -599,7 +601,10 @@ class TestRunActiveAgentJob:
             "provider_settings": provider_settings,
             "agent_runner": {
                 "runner_type": "local",
-                "config": {"misc": {"tool_call_timeout": 77}},
+                "config": {
+                    "model": {"fallback_provider_ids": ["fallback-provider"]},
+                    "misc": {"tool_call_timeout": 77},
+                },
             },
         }
         cron_manager.ctx = ctx
@@ -655,7 +660,7 @@ class TestRunActiveAgentJob:
         config = captured["config"]
         assert config.tool_call_timeout == 77
         assert config.provider_settings is provider_settings
-        assert config.provider_settings["fallback_chat_models"] == ["fallback-provider"]
+        assert config.fallback_provider_ids == ["fallback-provider"]
         request = captured["req"]
         assert "old question" not in request.system_prompt
         assert "old answer" not in request.system_prompt

@@ -16,6 +16,18 @@ from asyncio import Queue
 from astrbot.core import logger
 from astrbot.core.astrbot_config_mgr import AstrBotConfigManager
 from astrbot.core.pipeline.scheduler import PipelineScheduler
+from astrbot.core.platform.sources.telegram.inline_registry import (
+    telegram_inline_result_registry,
+)
+from astrbot.core.star.session_plugin_manager import (
+    SessionPluginManager,
+    apply_plugin_set,
+)
+from astrbot.core.star.star import star_map
+from astrbot.core.star.star_handler import (
+    EventType,
+    star_handlers_registry,
+)
 
 from .platform import AstrMessageEvent
 
@@ -43,6 +55,8 @@ class EventBus:
             conf_id = conf_info["id"]
             conf_name = conf_info.get("name") or conf_id
             self._print_event(event, conf_name)
+            if await self._maybe_handle_inline_query(event):
+                continue
             scheduler = self.pipeline_scheduler_mapping.get(conf_id)
             if not scheduler:
                 logger.error(
@@ -61,6 +75,111 @@ class EventBus:
         exc = task.exception()
         if exc is not None:
             logger.error("Pipeline task failed.", exc_info=exc)
+
+    async def _maybe_handle_inline_query(self, event: AstrMessageEvent) -> bool:
+        if not hasattr(event, "inline_query_id"):
+            return False
+        if hasattr(event, "inline_message_id"):
+            return False
+
+        query = str(getattr(event, "query", "") or "").strip()
+        conf = self.astrbot_config_mgr.get_conf(event.unified_msg_origin)
+        apply_plugin_set(event, conf)
+
+        handlers = star_handlers_registry.get_handlers_by_event_type(
+            EventType.InlineQueryEvent,
+            plugins_name=event.plugins_name,
+        )
+        handlers = await SessionPluginManager.filter_handlers_by_session(
+            event,
+            handlers,
+        )
+
+        handlers_by_module = {}
+        for handler in handlers:
+            handlers_by_module.setdefault(handler.handler_module_path, []).append(
+                handler
+            )
+
+        inline_query_id = str(getattr(event, "inline_query_id", ""))
+        llm_result_id = telegram_inline_result_registry.register(
+            inline_query_id=inline_query_id,
+            kind="llm",
+            query=query,
+            ordinal=0,
+        )
+        options = [
+            {
+                "id": llm_result_id,
+                "title": "LLM",
+                "description": query or "Ask AstrBot's configured language model.",
+                "kind": "llm",
+            }
+        ]
+
+        for ordinal, (module_path, module_handlers) in enumerate(
+            handlers_by_module.items(), start=1
+        ):
+            md = star_map.get(module_path)
+            if not md:
+                continue
+            plugin_name = md.display_name or md.name or module_path.rsplit(".", 1)[-1]
+            description = md.desc or "Run this plugin for the inline query."
+            result_id = telegram_inline_result_registry.register(
+                inline_query_id=inline_query_id,
+                kind="plugin",
+                query=query,
+                ordinal=ordinal,
+                handlers=module_handlers,
+                plugin_module_path=module_path,
+                plugin_name=plugin_name,
+            )
+            options.append(
+                {
+                    "id": result_id,
+                    "title": str(plugin_name),
+                    "description": str(description),
+                    "kind": "plugin",
+                }
+            )
+
+        if self._normalize_inline_command_query(query, conf) is not None:
+            command_result_id = telegram_inline_result_registry.register(
+                inline_query_id=inline_query_id,
+                kind="command",
+                query=query,
+                ordinal=len(options),
+                use_command_flow=True,
+            )
+            options.append(
+                {
+                    "id": command_result_id,
+                    "title": "插件命令",
+                    "description": query or "Run a command plugin.",
+                    "kind": "command",
+                }
+            )
+
+        if hasattr(event, "answer_inline_options"):
+            await event.answer_inline_options(options)
+        else:
+            logger.warning("Inline query event does not support targeted options.")
+
+        return True
+
+    def _normalize_inline_command_query(
+        self,
+        query: str,
+        conf: dict,
+    ) -> str | None:
+        message = query.strip()
+        if not message:
+            return None
+        for wake_prefix in conf.get("wake_prefix", []):
+            wake_prefix = str(wake_prefix)
+            if wake_prefix and message.startswith(wake_prefix):
+                return message[len(wake_prefix) :].strip()
+        return None
 
     def _print_event(self, event: AstrMessageEvent, conf_name: str) -> None:
         """用于记录事件信息

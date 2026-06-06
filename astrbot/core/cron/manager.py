@@ -271,6 +271,7 @@ class CronJobManager:
                 args=[job.job_id],
                 replace_existing=True,
                 misfire_grace_time=30,
+                max_instances=1,
             )
             asyncio.create_task(
                 self.db.update_cron_job(
@@ -442,15 +443,15 @@ class CronJobManager:
             cron_event.role = "admin"
 
         provider_settings = cfg.get("provider_settings", {}) or {}
+        agent_runner_config = cfg.get("agent_runner", {}).get("config", {})
+        model_config = agent_runner_config.get("model", {})
         tool_call_timeout = (
-            cfg.get("agent_runner", {})
-            .get("config", {})
+            agent_runner_config
             .get("misc", {})
             .get("tool_call_timeout", 120)
         )
         agent_max_step = coerce_int_config(
-            cfg.get("agent_runner", {})
-            .get("config", {})
+            agent_runner_config
             .get("misc", {})
             .get("max_steps", 30),
             default=30,
@@ -462,6 +463,8 @@ class CronJobManager:
             llm_safety_mode=False,
             streaming_response=False,
             provider_settings=provider_settings,
+            fallback_provider_ids=model_config.get("fallback_provider_ids", []),
+            request_max_retries=model_config.get("request_max_retries", 5),
         )
         req = ProviderRequest()
         conv = await _get_session_conv(event=cron_event, plugin_context=self.ctx)
