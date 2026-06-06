@@ -7,6 +7,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from astrbot.core import astr_main_agent as ama
+from astrbot.core.agent.agent import Agent
+from astrbot.core.agent.handoff import HandoffTool
 from astrbot.core.agent.mcp_client import MCPTool
 from astrbot.core.agent.message import Message, dump_messages_with_checkpoints
 from astrbot.core.agent.tool import FunctionTool, ToolSet
@@ -1165,7 +1167,7 @@ class TestEnsurePersonaAndSkills:
     async def test_subagent_dedupe_uses_default_persona_tools(
         self, mock_event, mock_context
     ):
-        """Test dedupe uses resolved default persona tools in subagent mode."""
+        """Subagent handoffs are exposed only through persona tool selection."""
         module = ama
         mock_context.persona_manager.resolve_selected_persona = AsyncMock(
             return_value=(None, None, None, False)
@@ -1215,9 +1217,202 @@ class TestEnsurePersonaAndSkills:
         await module._ensure_persona_and_skills(req, {}, mock_context, mock_event)
 
         assert req.func_tool is not None
+        assert "transfer_to_planner" not in req.func_tool.names()
+        assert "tool_a" in req.func_tool.names()
+        assert "tool_b" in req.func_tool.names()
+
+    @pytest.mark.asyncio
+    async def test_subagent_dedupe_uses_selected_handoff_persona_tools(
+        self, mock_event, mock_context
+    ):
+        """Test dedupe uses selected handoff subagent persona tools."""
+        module = ama
+        router_persona = {
+            "prompt": "router prompt",
+            "tools": ["transfer_to_planner", "tool_a", "tool_b"],
+            "skills": None,
+        }
+        mock_context.persona_manager.resolve_selected_persona = AsyncMock(
+            return_value=("router", router_persona, None, False)
+        )
+        mock_context.persona_manager.get_persona_v3_by_id = MagicMock(
+            return_value={"name": "default", "tools": ["tool_a"]}
+        )
+
+        tool_a = FunctionTool(
+            name="tool_a",
+            parameters={"type": "object", "properties": {}},
+            description="tool a",
+        )
+        tool_b = FunctionTool(
+            name="tool_b",
+            parameters={"type": "object", "properties": {}},
+            description="tool b",
+        )
+        tmgr = mock_context.get_llm_tool_manager.return_value
+        tmgr.func_list = [tool_a, tool_b]
+        tmgr.get_full_tool_set.return_value = ToolSet([tool_a, tool_b])
+        tmgr.get_func.side_effect = lambda name: {
+            "tool_a": tool_a,
+            "tool_b": tool_b,
+        }.get(name)
+
+        handoff = HandoffTool(
+            agent=Agent(
+                name="planner",
+                instructions="planner prompt",
+                tools=["tool_a"],
+            )
+        )
+        mock_context.subagent_orchestrator = MagicMock(handoffs=[handoff])
+        mock_context.subagent_orchestrator.get_handoff.side_effect = lambda name: {
+            handoff.name: handoff,
+        }.get(name)
+        mock_context.get_config.return_value = {
+            "subagent_orchestrator": {
+                "main_enable": True,
+                "remove_main_duplicate_tools": True,
+                "agents": [
+                    {
+                        "name": "planner",
+                        "enabled": True,
+                        "persona_id": "default",
+                    }
+                ],
+            }
+        }
+
+        req = ProviderRequest()
+        req.conversation = MagicMock(persona_id="router")
+
+        await module._ensure_persona_and_skills(req, {}, mock_context, mock_event)
+
+        assert req.func_tool is not None
         assert "transfer_to_planner" in req.func_tool.names()
         assert "tool_a" not in req.func_tool.names()
         assert "tool_b" in req.func_tool.names()
+
+    @pytest.mark.asyncio
+    async def test_subagent_handoff_is_mounted_when_persona_uses_all_tools(
+        self, mock_event, mock_context
+    ):
+        """Persona tools=None should include available subagent handoff tools."""
+        module = ama
+        router_persona = {
+            "prompt": "router prompt",
+            "tools": None,
+            "skills": None,
+        }
+        mock_context.persona_manager.resolve_selected_persona = AsyncMock(
+            return_value=("router", router_persona, None, False)
+        )
+        mock_context.persona_manager.get_persona_v3_by_id = MagicMock(
+            return_value={"name": "default", "tools": ["tool_a"]}
+        )
+
+        tool_a = FunctionTool(
+            name="tool_a",
+            parameters={"type": "object", "properties": {}},
+            description="tool a",
+        )
+        tool_b = FunctionTool(
+            name="tool_b",
+            parameters={"type": "object", "properties": {}},
+            description="tool b",
+        )
+        tmgr = mock_context.get_llm_tool_manager.return_value
+        tmgr.func_list = [tool_a, tool_b]
+        tmgr.get_full_tool_set.return_value = ToolSet([tool_a, tool_b])
+        tmgr.get_func.side_effect = lambda name: {
+            "tool_a": tool_a,
+            "tool_b": tool_b,
+        }.get(name)
+
+        handoff = HandoffTool(
+            agent=Agent(
+                name="planner",
+                instructions="planner prompt",
+                tools=["tool_a"],
+            )
+        )
+        mock_context.subagent_orchestrator = MagicMock(handoffs=[handoff])
+        mock_context.get_config.return_value = {
+            "subagent_orchestrator": {
+                "main_enable": True,
+                "remove_main_duplicate_tools": True,
+                "agents": [
+                    {
+                        "name": "planner",
+                        "enabled": True,
+                        "persona_id": "default",
+                    }
+                ],
+            }
+        }
+
+        req = ProviderRequest()
+        req.conversation = MagicMock(persona_id="router")
+
+        await module._ensure_persona_and_skills(req, {}, mock_context, mock_event)
+
+        assert req.func_tool is not None
+        assert "transfer_to_planner" in req.func_tool.names()
+        assert "tool_a" not in req.func_tool.names()
+        assert "tool_b" in req.func_tool.names()
+
+    @pytest.mark.asyncio
+    async def test_persona_missing_tools_field_does_not_use_all_tools(
+        self, mock_event, mock_context
+    ):
+        """Missing tools is treated as no explicit tool selection."""
+        module = ama
+        router_persona = {
+            "prompt": "router prompt",
+            "skills": None,
+        }
+        mock_context.persona_manager.resolve_selected_persona = AsyncMock(
+            return_value=("router", router_persona, None, False)
+        )
+
+        tool_a = FunctionTool(
+            name="tool_a",
+            parameters={"type": "object", "properties": {}},
+            description="tool a",
+        )
+        tmgr = mock_context.get_llm_tool_manager.return_value
+        tmgr.func_list = [tool_a]
+        tmgr.get_full_tool_set.return_value = ToolSet([tool_a])
+        tmgr.get_func.side_effect = lambda name: {"tool_a": tool_a}.get(name)
+
+        handoff = HandoffTool(
+            agent=Agent(
+                name="planner",
+                instructions="planner prompt",
+                tools=["tool_a"],
+            )
+        )
+        mock_context.subagent_orchestrator = MagicMock(handoffs=[handoff])
+        mock_context.get_config.return_value = {
+            "subagent_orchestrator": {
+                "main_enable": True,
+                "remove_main_duplicate_tools": False,
+                "agents": [
+                    {
+                        "name": "planner",
+                        "enabled": True,
+                        "persona_id": "default",
+                    }
+                ],
+            }
+        }
+
+        req = ProviderRequest()
+        req.conversation = MagicMock(persona_id="router")
+
+        await module._ensure_persona_and_skills(req, {}, mock_context, mock_event)
+
+        assert req.func_tool is not None
+        assert req.func_tool.names() == []
 
 
 class TestDecorateLlmRequest:
@@ -1388,7 +1583,11 @@ class TestBuildMainAgent:
 
         with (
             patch("astrbot.core.astr_main_agent.AgentRunner") as mock_runner_cls,
-            patch("astrbot.core.astr_main_agent.AstrAgentContext"),
+            patch("astrbot.core.astr_main_agent.AstrAgentContext") as mock_ctx_cls,
+            patch(
+                "astrbot.core.astr_main_agent.get_fallback_chat_providers",
+                return_value=["fallback-provider"],
+            ),
         ):
             mock_runner = MagicMock()
             mock_runner.reset = AsyncMock()
@@ -1402,6 +1601,53 @@ class TestBuildMainAgent:
 
         assert result is not None
         assert isinstance(result, module.MainAgentBuildResult)
+        ctx_kwargs = mock_ctx_cls.call_args.kwargs
+        assert ctx_kwargs["extra"]["provider_settings"] == {}
+
+    @pytest.mark.asyncio
+    async def test_build_main_agent_passes_provider_settings_to_run_context(
+        self, mock_event, mock_context, mock_provider
+    ):
+        """Subagent handoffs should share the main agent's runtime provider settings."""
+        module = ama
+        mock_context.get_provider_by_id.return_value = None
+        mock_context.get_using_provider.return_value = mock_provider
+        mock_context.get_config.return_value = {}
+
+        conv_mgr = mock_context.conversation_manager
+        _setup_conversation_for_build(conv_mgr)
+
+        provider_settings = {
+            "fallback_chat_models": ["fallback-provider"],
+            "max_agent_step": 9,
+            "streaming_response": True,
+        }
+
+        with (
+            patch("astrbot.core.astr_main_agent.AgentRunner") as mock_runner_cls,
+            patch("astrbot.core.astr_main_agent.AstrAgentContext") as mock_ctx_cls,
+            patch(
+                "astrbot.core.astr_main_agent.get_fallback_chat_providers",
+                return_value=["fallback-provider"],
+            ),
+        ):
+            mock_runner = MagicMock()
+            mock_runner.reset = AsyncMock()
+            mock_runner_cls.return_value = mock_runner
+
+            result = await module.build_main_agent(
+                event=mock_event,
+                plugin_context=mock_context,
+                config=module.MainAgentBuildConfig(
+                    tool_call_timeout=60,
+                    provider_settings=provider_settings,
+                ),
+            )
+
+        assert result is not None
+        ctx_kwargs = mock_ctx_cls.call_args.kwargs
+        assert ctx_kwargs["extra"]["provider_settings"] == provider_settings
+        assert ctx_kwargs["extra"]["provider_settings"] is not provider_settings
 
     @pytest.mark.asyncio
     async def test_build_main_agent_passes_max_context_length_to_runner(
@@ -1468,6 +1714,10 @@ class TestBuildMainAgent:
         with (
             patch("astrbot.core.astr_main_agent.AgentRunner") as mock_runner_cls,
             patch("astrbot.core.astr_main_agent.AstrAgentContext"),
+            patch(
+                "astrbot.core.astr_main_agent.get_fallback_chat_providers",
+                return_value=["fallback-provider"],
+            ),
         ):
             mock_runner = MagicMock()
             mock_runner.reset = AsyncMock()
@@ -1523,6 +1773,10 @@ class TestBuildMainAgent:
         with (
             patch("astrbot.core.astr_main_agent.AgentRunner") as mock_runner_cls,
             patch("astrbot.core.astr_main_agent.AstrAgentContext"),
+            patch(
+                "astrbot.core.astr_main_agent.get_fallback_chat_providers",
+                return_value=["fallback-provider"],
+            ),
         ):
             mock_runner = MagicMock()
             mock_runner.reset = AsyncMock()
@@ -2030,6 +2284,10 @@ class TestBuildMainAgent:
         with (
             patch("astrbot.core.astr_main_agent.AgentRunner") as mock_runner_cls,
             patch("astrbot.core.astr_main_agent.AstrAgentContext"),
+            patch(
+                "astrbot.core.astr_main_agent.get_fallback_chat_providers",
+                return_value=["fallback-provider"],
+            ) as mock_get_fallback_chat_providers,
         ):
             mock_runner = MagicMock()
             mock_runner.reset = AsyncMock()
@@ -2044,7 +2302,11 @@ class TestBuildMainAgent:
 
         assert result is not None
         assert result.reset_coro is not None
+        mock_get_fallback_chat_providers.assert_called_once()
         mock_runner.reset.assert_called_once()
+        assert mock_runner.reset.call_args.kwargs["fallback_providers"] == [
+            "fallback-provider"
+        ]
         result.reset_coro.close()
 
     @pytest.mark.asyncio

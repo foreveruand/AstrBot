@@ -131,6 +131,8 @@ class RespondStage(Stage):
         """检查是否需要分段回复"""
         if not self.enable_seg:
             return False
+        if hasattr(event, "inline_query_id"):
+            return False
 
         if (result := event.get_result()) is None:
             return False
@@ -266,14 +268,21 @@ class RespondStage(Stage):
                         f"actual_chain: {result.chain}",
                     )
                     return
-                for comp in result.chain:
+                comps_list = list(result.chain)
+                for idx, comp in enumerate(comps_list):
                     i = await self._calc_comp_interval(comp)
                     await asyncio.sleep(i)
+                    is_last = idx == len(comps_list) - 1
                     try:
                         if comp.type in need_separately:
-                            await event.send(result.derive([comp]))
+                            chain = result.derive([comp])
+                            chain.reply_markup = None
+                            await event.send(chain)
                         else:
-                            await event.send(result.derive([*header_comps, comp]))
+                            chain = result.derive([*header_comps, comp])
+                            if not is_last:
+                                chain.reply_markup = None
+                            await event.send(chain)
                             header_comps.clear()
                     except Exception as e:
                         logger.error(
@@ -299,6 +308,7 @@ class RespondStage(Stage):
                 )
                 for comp in sep_comps:
                     chain = result.derive([comp])
+                    chain.reply_markup = None
                     try:
                         await event.send(chain)
                     except Exception as e:

@@ -39,6 +39,7 @@ from astrbot.core.persona_error_reply import (
 from astrbot.core.platform.astr_message_event import AstrMessageEvent
 from astrbot.core.provider import Provider
 from astrbot.core.provider.entities import ProviderRequest
+from astrbot.core.provider.fallback import get_fallback_chat_providers
 from astrbot.core.provider.register import llm_tools
 from astrbot.core.skills.skill_manager import (
     SkillInfo,
@@ -250,6 +251,17 @@ def _select_provider(
         logger.error("Error occurred while selecting provider: %s", exc)
         _set_llm_error_message(event, f"LLM 请求失败：{exc}")
         return None
+
+
+def _provider_supports_modality(provider: Provider, modality: str) -> bool:
+    provider_config = getattr(provider, "provider_config", None)
+    if not isinstance(provider_config, dict):
+        return False
+
+    modalities = provider_config.get("modalities")
+    if modalities == []:
+        return True
+    return isinstance(modalities, list) and modality in modalities
 
 
 async def _get_session_conv(
@@ -560,18 +572,28 @@ async def _ensure_persona_and_skills(
                     "If you need to use these capabilities, ask the user to enable Computer Use in the AstrBot WebUI -> Config."
                 )
     tmgr = plugin_context.get_llm_tool_manager()
+    orch_cfg = plugin_context.get_config().get("subagent_orchestrator", {})
+    so = plugin_context.subagent_orchestrator
+    subagent_handoff_enabled = bool(orch_cfg.get("main_enable", False) and so)
 
     # inject toolset in the persona
-    if (persona and persona.get("tools") is None) or not persona:
+    persona_tools_config = persona.get("tools", []) if persona is not None else None
+    if persona_tools_config is None or persona is None:
         persona_toolset = tmgr.get_full_tool_set()
         for tool in list(persona_toolset):
             if not tool.active:
                 persona_toolset.remove_tool(tool.name)
+        if persona is not None and subagent_handoff_enabled:
+            for tool in so.handoffs:
+                if tool.active:
+                    persona_toolset.add_tool(tool)
     else:
         persona_toolset = ToolSet()
-        if persona["tools"]:
-            for tool_name in persona["tools"]:
+        if persona_tools_config:
+            for tool_name in persona_tools_config:
                 tool = tmgr.get_func(tool_name)
+                if tool is None and subagent_handoff_enabled:
+                    tool = so.get_handoff(tool_name)
                 if tool and tool.active:
                     persona_toolset.add_tool(tool)
     if not req.func_tool:
@@ -580,25 +602,33 @@ async def _ensure_persona_and_skills(
         req.func_tool.merge(persona_toolset)
 
     # sub agents integration
-    orch_cfg = plugin_context.get_config().get("subagent_orchestrator", {})
-    so = plugin_context.subagent_orchestrator
-    if orch_cfg.get("main_enable", False) and so:
+    selected_handoffs = [
+        tool
+        for tool in (req.func_tool.tools if req.func_tool else [])
+        if isinstance(tool, HandoffTool)
+    ]
+    if subagent_handoff_enabled and selected_handoffs:
         remove_dup = bool(orch_cfg.get("remove_main_duplicate_tools", False))
 
         assigned_tools: set[str] = set()
+        selected_handoff_agent_names = {tool.agent.name for tool in selected_handoffs}
         agents = orch_cfg.get("agents", [])
-        if isinstance(agents, list):
+        if remove_dup and isinstance(agents, list):
             for a in agents:
                 if not isinstance(a, dict):
                     continue
                 if a.get("enabled", True) is False:
                     continue
+                if str(a.get("name", "")).strip() not in selected_handoff_agent_names:
+                    continue
                 persona_tools = None
                 pid = a.get("persona_id")
                 if pid:
-                    persona = plugin_context.persona_manager.get_persona_v3_by_id(pid)
-                    if persona is not None:
-                        persona_tools = persona.get("tools")
+                    agent_persona = plugin_context.persona_manager.get_persona_v3_by_id(
+                        pid
+                    )
+                    if agent_persona is not None:
+                        persona_tools = agent_persona.get("tools")
                 tools = a.get("tools", [])
                 if persona_tools is not None:
                     tools = persona_tools
@@ -621,13 +651,9 @@ async def _ensure_persona_and_skills(
         if req.func_tool is None:
             req.func_tool = ToolSet()
 
-        # add subagent handoff tools
-        for tool in so.handoffs:
-            req.func_tool.add_tool(tool)
-
         # check duplicates
         if remove_dup:
-            handoff_names = {tool.name for tool in so.handoffs}
+            handoff_names = {tool.name for tool in selected_handoffs}
             for tool_name in assigned_tools:
                 if tool_name in handoff_names:
                     continue
@@ -1289,75 +1315,6 @@ def _get_compress_provider(
     return None
 
 
-def _get_fallback_chat_providers(
-    provider: Provider, plugin_context: Context, provider_settings: dict
-) -> list[Provider]:
-    fallback_ids = provider_settings.get("fallback_chat_models", [])
-    if not isinstance(fallback_ids, list):
-        logger.warning(
-            "fallback_chat_models setting is not a list, skip fallback providers."
-        )
-        return []
-
-    provider_id = str(provider.provider_config.get("id", ""))
-    seen_provider_ids: set[str] = {provider_id} if provider_id else set()
-    fallbacks: list[Provider] = []
-
-    for fallback_id in fallback_ids:
-        if not isinstance(fallback_id, str) or not fallback_id:
-            continue
-        if fallback_id in seen_provider_ids:
-            continue
-        fallback_provider = plugin_context.get_provider_by_id(fallback_id)
-        if fallback_provider is None:
-            logger.warning("Fallback chat provider `%s` not found, skip.", fallback_id)
-            continue
-        if not isinstance(fallback_provider, Provider):
-            logger.warning(
-                "Fallback chat provider `%s` is invalid type: %s, skip.",
-                fallback_id,
-                type(fallback_provider),
-            )
-            continue
-        fallbacks.append(fallback_provider)
-        seen_provider_ids.add(fallback_id)
-    return fallbacks
-
-
-def _provider_supports_modality(provider: Provider, modality: str) -> bool:
-    modalities = provider.provider_config.get("modalities", None)
-    if modalities == []:
-        return True  # Empty list from migration is treated as unconfigured for backward compatibility
-    return isinstance(modalities, list) and modality in modalities
-
-
-def _select_image_chat_provider(
-    provider: Provider,
-    req: ProviderRequest,
-    fallback_providers: list[Provider],
-) -> Provider:
-    if not req.image_urls or _provider_supports_modality(provider, "image"):
-        return provider
-
-    provider_id = provider.provider_config.get("id", "<unknown>")
-    for fallback_provider in fallback_providers:
-        if not _provider_supports_modality(fallback_provider, "image"):
-            continue
-        fallback_id = fallback_provider.provider_config.get("id", "<unknown>")
-        logger.warning(
-            "Chat provider %s does not support image input, switching this request to fallback provider %s.",
-            provider_id,
-            fallback_id,
-        )
-        return fallback_provider
-
-    logger.warning(
-        "Chat provider %s does not support image input and no image-capable fallback provider is available.",
-        provider_id,
-    )
-    return provider
-
-
 async def build_main_agent(
     *,
     event: AstrMessageEvent,
@@ -1554,6 +1511,27 @@ async def build_main_agent(
         else:
             return None
 
+    fallback_providers = get_fallback_chat_providers(
+        provider, plugin_context, config.provider_settings
+    )
+    if req.image_urls and not _provider_supports_modality(provider, "image"):
+        image_fallback_provider = next(
+            (
+                fallback_provider
+                for fallback_provider in fallback_providers
+                if _provider_supports_modality(fallback_provider, "image")
+            ),
+            None,
+        )
+        if image_fallback_provider is not None:
+            provider = image_fallback_provider
+            req.model = None
+            fallback_providers = [
+                fallback_provider
+                for fallback_provider in fallback_providers
+                if fallback_provider is not image_fallback_provider
+            ]
+
     await _decorate_llm_request(event, req, plugin_context, config, provider=provider)
 
     await _apply_kb(event, req, plugin_context, config)
@@ -1576,6 +1554,7 @@ async def build_main_agent(
     astr_agent_ctx = AstrAgentContext(
         context=plugin_context,
         event=event,
+        extra={"provider_settings": copy.deepcopy(config.provider_settings)},
     )
 
     if config.add_cron_tools:
@@ -1589,16 +1568,6 @@ async def build_main_agent(
                 SendMessageToUserTool
             )
         )
-
-    fallback_providers = _get_fallback_chat_providers(
-        provider, plugin_context, config.provider_settings
-    )
-    selected_provider = _select_image_chat_provider(provider, req, fallback_providers)
-    if selected_provider is not provider:
-        provider = selected_provider
-        if req.model:
-            req.model = None
-        fallback_providers = [p for p in fallback_providers if p is not provider]
 
     if provider.provider_config.get("max_context_tokens", 0) <= 0:
         model = provider.get_model()

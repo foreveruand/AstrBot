@@ -656,9 +656,9 @@ class TavilyWebSearchTool(FunctionTool[AstrAgentContext]):
         time_range = kwargs.get("time_range", "")
         if time_range in ["day", "week", "month", "year"]:
             payload["time_range"] = time_range
-        if kwargs.get("start_date"):
+        elif kwargs.get("start_date"):
             payload["start_date"] = kwargs["start_date"]
-        if kwargs.get("end_date"):
+        if "time_range" not in payload and kwargs.get("end_date"):
             payload["end_date"] = kwargs["end_date"]
 
         results = await _tavily_search(provider_settings, payload)

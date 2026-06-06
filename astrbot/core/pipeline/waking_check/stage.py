@@ -1,15 +1,28 @@
 from collections.abc import AsyncGenerator, Callable
 
 from astrbot import logger
+from astrbot.builtin_stars.builtin_commands.commands.conversation import (
+    THIRD_PARTY_AGENT_RUNNER_KEY,
+)
 from astrbot.core.message.components import At, AtAll, Reply
 from astrbot.core.message.message_event_result import MessageChain, MessageEventResult
 from astrbot.core.platform.astr_message_event import AstrMessageEvent
 from astrbot.core.platform.message_type import MessageType
+from astrbot.core.platform.sources.telegram.inline_registry import (
+    TELEGRAM_INLINE_STOP_CALLBACK_DATA,
+    telegram_inline_result_registry,
+    telegram_inline_stop_registry,
+)
+from astrbot.core.star.filter.command import CommandFilter
 from astrbot.core.star.filter.command_group import CommandGroupFilter
 from astrbot.core.star.filter.permission import PermissionTypeFilter
-from astrbot.core.star.session_plugin_manager import SessionPluginManager
+from astrbot.core.star.session_plugin_manager import (
+    SessionPluginManager,
+    apply_plugin_set,
+)
 from astrbot.core.star.star import star_map
 from astrbot.core.star.star_handler import EventType, star_handlers_registry
+from astrbot.core.utils.active_event_registry import active_event_registry
 
 from ..context import PipelineContext
 from ..stage import Stage, register_stage
@@ -74,6 +87,92 @@ class WakingCheckStage(Stage):
         platform_settings = self.ctx.astrbot_config.get("platform_settings", {})
         self.unique_session = platform_settings.get("unique_session", False)
 
+    def _set_enabled_plugins(self, event: AstrMessageEvent) -> None:
+        apply_plugin_set(event, self.ctx.astrbot_config)
+        logger.debug(
+            f"enabled_plugins_name: {self.ctx.astrbot_config.get('plugin_set', ['*'])}"
+        )
+
+    def _normalize_command_prefix(self, event: AstrMessageEvent) -> bool:
+        message = (event.message_str or "").strip()
+        event._extras.pop("wake_prefix", None)
+        for wake_prefix in self.ctx.astrbot_config["wake_prefix"]:
+            if message.startswith(wake_prefix):
+                event.message_str = message[len(wake_prefix) :].strip()
+                event.set_extra("wake_prefix", wake_prefix)
+                return True
+        return False
+
+    def _should_skip_command_filters_for_chosen_inline(
+        self,
+        handler,
+        is_chosen_inline_result: bool,
+        chosen_inline_command_mode: bool,
+    ) -> bool:
+        # Only skip command filters when handling a chosen inline result without a command prefix
+        if not is_chosen_inline_result or chosen_inline_command_mode:
+            return False
+        return any(
+            isinstance(filter_, CommandFilter | CommandGroupFilter)
+            for filter_ in handler.event_filters
+        )
+
+    async def _handle_inline_stop_callback(self, event: AstrMessageEvent) -> bool:
+        if getattr(
+            event, "data", ""
+        ) != TELEGRAM_INLINE_STOP_CALLBACK_DATA or not getattr(
+            event, "inline_message_id", None
+        ):
+            return False
+
+        stop_target = telegram_inline_stop_registry.resolve(event.inline_message_id)
+        if stop_target is None:
+            await event.answer_callback_query("No running task in this inline session.")
+            event.stop_event()
+            return True
+
+        if str(event.get_sender_id()) != stop_target.owner_user_id:
+            await event.answer_callback_query(
+                "Only the user who triggered this inline task can stop it."
+            )
+            event.stop_event()
+            return True
+
+        get_config = getattr(self.ctx, "get_config", None)
+        if callable(get_config):
+            cfg = get_config(umo=stop_target.unified_msg_origin)
+        else:
+            cfg = self.ctx.astrbot_config
+        if not isinstance(cfg, dict):
+            cfg = self.ctx.astrbot_config
+
+        agent_runner_type = cfg.get("provider_settings", {}).get(
+            "agent_runner_type",
+            "local",
+        )
+        if agent_runner_type in THIRD_PARTY_AGENT_RUNNER_KEY:
+            stopped_count = active_event_registry.stop_all(
+                stop_target.unified_msg_origin
+            )
+        else:
+            stopped_count = active_event_registry.request_agent_stop_all(
+                stop_target.unified_msg_origin
+            )
+
+        if stopped_count > 0:
+            await event.answer_callback_query(
+                f"Requested to stop {stopped_count} running tasks."
+            )
+            if hasattr(event, "set_inline_stop_requested_markup"):
+                await event.set_inline_stop_requested_markup()
+        else:
+            await event.answer_callback_query(
+                "No running tasks in the current session."
+            )
+
+        event.stop_event()
+        return True
+
     async def process(
         self,
         event: AstrMessageEvent,
@@ -99,10 +198,72 @@ class WakingCheckStage(Stage):
                 event.role = "admin"
                 break
 
+        # Telegram 回调查询事件：跳过唤醒逻辑，直接分发对应 handler
+        if hasattr(event, "callback_query_id"):
+            if await self._handle_inline_stop_callback(event):
+                return
+            self._set_enabled_plugins(event)
+
+            event.is_wake = True
+            event.is_at_or_wake_command = True
+
+            activated_handlers = star_handlers_registry.get_handlers_by_event_type(
+                EventType.CallbackQueryEvent,
+                plugins_name=event.plugins_name,
+            )
+            activated_handlers = await SessionPluginManager.filter_handlers_by_session(
+                event,
+                activated_handlers,
+            )
+            event.set_extra("activated_handlers", activated_handlers)
+            event.set_extra("handlers_parsed_params", {})
+            return
+
+        is_chosen_inline_result = hasattr(event, "result_id") and hasattr(
+            event, "inline_message_id"
+        )
+        chosen_inline_command_mode = False
+        if is_chosen_inline_result:
+            target = telegram_inline_result_registry.resolve(str(event.result_id))
+            if target is not None:
+                self._set_enabled_plugins(event)
+                event.is_wake = True
+                event.is_at_or_wake_command = True
+                if target.query:
+                    event.query = target.query
+                    event.message_str = target.query
+
+                if target.kind == "command" or target.use_command_flow:
+                    chosen_inline_command_mode = self._normalize_command_prefix(event)
+                elif target.kind == "plugin":
+                    activated_handlers = target.handlers or []
+                    activated_handlers = (
+                        await SessionPluginManager.filter_handlers_by_session(
+                            event,
+                            activated_handlers,
+                        )
+                    )
+                    event.call_llm = True
+                    event.set_extra("activated_handlers", activated_handlers)
+                    event.set_extra("handlers_parsed_params", {})
+                    return
+
+                else:
+                    event.call_llm = False
+                    event.set_extra("activated_handlers", [])
+                    event.set_extra("handlers_parsed_params", {})
+                    return
+
+            else:
+                self._set_enabled_plugins(event)
+                event.is_wake = True
+                event.is_at_or_wake_command = True
+                chosen_inline_command_mode = self._normalize_command_prefix(event)
+
         # 检查 wake
         wake_prefixes = self.ctx.astrbot_config["wake_prefix"]
         messages = event.get_messages()
-        is_wake = False
+        is_wake = is_chosen_inline_result
         for wake_prefix in wake_prefixes:
             if event.message_str.startswith(wake_prefix):
                 if (
@@ -117,8 +278,10 @@ class WakingCheckStage(Stage):
                 event.is_at_or_wake_command = True
                 event.is_wake = True
                 event.message_str = event.message_str[len(wake_prefix) :].strip()
+                event.set_extra("wake_prefix", wake_prefix)
                 break
         if not is_wake:
+            event._extras.pop("wake_prefix", None)
             # 检查是否有at消息 / at全体成员消息 / 引用了bot的消息
             for message in messages:
                 if (
@@ -152,13 +315,7 @@ class WakingCheckStage(Stage):
         handlers_parsed_params = {}  # 注册了指令的 handler
 
         # 将 plugins_name 设置到 event 中
-        enabled_plugins_name = self.ctx.astrbot_config.get("plugin_set", ["*"])
-        if enabled_plugins_name == ["*"]:
-            # 如果是 *，则表示所有插件都启用
-            event.plugins_name = None
-        else:
-            event.plugins_name = enabled_plugins_name
-        logger.debug(f"enabled_plugins_name: {enabled_plugins_name}")
+        self._set_enabled_plugins(event)
 
         for handler in star_handlers_registry.get_handlers_by_event_type(
             EventType.AdapterMessageEvent,
@@ -168,6 +325,13 @@ class WakingCheckStage(Stage):
                 self.disable_builtin_commands
                 and handler.handler_module_path
                 == "astrbot.builtin_stars.builtin_commands.main"
+            ):
+                continue
+
+            if self._should_skip_command_filters_for_chosen_inline(
+                handler,
+                is_chosen_inline_result,
+                chosen_inline_command_mode,
             ):
                 continue
 
@@ -234,6 +398,17 @@ class WakingCheckStage(Stage):
             event,
             activated_handlers,
         )
+
+        if is_chosen_inline_result:
+            chosen_handlers = star_handlers_registry.get_handlers_by_event_type(
+                EventType.ChosenInlineResultEvent,
+                plugins_name=event.plugins_name,
+            )
+            chosen_handlers = await SessionPluginManager.filter_handlers_by_session(
+                event,
+                chosen_handlers,
+            )
+            activated_handlers.extend(chosen_handlers)
 
         event.set_extra("activated_handlers", activated_handlers)
         event.set_extra("handlers_parsed_params", handlers_parsed_params)

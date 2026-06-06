@@ -1407,7 +1407,7 @@ class ProviderConfigService:
 
         from astrbot.core.provider import Provider
         from astrbot.core.provider.register import provider_cls_map
-        from astrbot.core.utils.llm_metadata import LLM_METADATAS
+        from astrbot.core.utils.llm_metadata import get_llm_metadata
 
         provider_type = source.get("type")
         if not provider_type:
@@ -1432,9 +1432,9 @@ class ProviderConfigService:
                 "models": models,
                 "provider_source_id": source_id,
                 "model_metadata": {
-                    model_id: LLM_METADATAS[model_id]
+                    model_id: meta
                     for model_id in models
-                    if model_id in LLM_METADATAS
+                    if (meta := get_llm_metadata(model_id))
                 },
             }
         finally:
@@ -1454,7 +1454,7 @@ class ProviderConfigService:
 
     async def list_provider_models(self, provider_id: str) -> dict:
         from astrbot.core.provider import Provider
-        from astrbot.core.utils.llm_metadata import LLM_METADATAS
+        from astrbot.core.utils.llm_metadata import get_llm_metadata
 
         provider = self.provider_manager.inst_map.get(provider_id)
         if not provider:
@@ -1468,9 +1468,9 @@ class ProviderConfigService:
             "models": models,
             "provider_id": provider_id,
             "model_metadata": {
-                model_id: LLM_METADATAS[model_id]
+                model_id: meta
                 for model_id in models
-                if model_id in LLM_METADATAS
+                if (meta := get_llm_metadata(model_id))
             },
         }
 

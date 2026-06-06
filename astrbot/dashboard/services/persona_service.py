@@ -47,7 +47,7 @@ class PersonaService:
             str(raw_system_prompt).strip() if raw_system_prompt is not None else ""
         )
         begin_dialogs = payload.get("begin_dialogs", [])
-        tools = payload.get("tools")
+        tools = payload.get("tools") if "tools" in payload else []
         skills = payload.get("skills")
         custom_error_message = self._normalize_custom_error_message(
             payload.get("custom_error_message")
@@ -66,8 +66,8 @@ class PersonaService:
             persona_id=persona_id,
             system_prompt=system_prompt,
             begin_dialogs=begin_dialogs if begin_dialogs else None,
-            tools=tools if tools else None,
-            skills=skills if skills else None,
+            tools=tools,
+            skills=skills,
             custom_error_message=custom_error_message,
             folder_id=folder_id,
             sort_order=sort_order,

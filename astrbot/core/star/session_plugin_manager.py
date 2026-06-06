@@ -4,6 +4,16 @@ from astrbot.core import logger, sp
 from astrbot.core.platform.astr_message_event import AstrMessageEvent
 
 
+def apply_plugin_set(event: AstrMessageEvent, conf: dict) -> None:
+    """根据 conf 中的 plugin_set 配置设置 event.plugins_name。
+
+    ``["*"]`` 表示启用全部插件（plugins_name = None），
+    其他值直接作为白名单列表。
+    """
+    enabled = conf.get("plugin_set", ["*"])
+    event.plugins_name = None if enabled == ["*"] else enabled
+
+
 class SessionPluginManager:
     """管理会话级别的插件启停状态"""
 

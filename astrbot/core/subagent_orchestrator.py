@@ -12,6 +12,9 @@ if TYPE_CHECKING:
     from astrbot.core.persona_mgr import PersonaManager
 
 
+HANDOFF_HANDLER_MODULE_PATH = "core.subagent_orchestrator"
+
+
 class SubAgentOrchestrator:
     """Loads subagent definitions from config and registers handoff tools.
 
@@ -70,7 +73,7 @@ class SubAgentOrchestrator:
                 begin_dialogs = copy.deepcopy(
                     persona_data.get("_begin_dialogs_processed")
                 )
-                tools = persona_data.get("tools")
+                tools = persona_data.get("tools", [])
                 if public_description == "" and prompt:
                     public_description = prompt[:120]
             if tools is None:
@@ -92,6 +95,7 @@ class SubAgentOrchestrator:
                 agent=agent,
                 tool_description=public_description or None,
             )
+            handoff.handler_module_path = HANDOFF_HANDLER_MODULE_PATH
 
             # Optional per-subagent chat provider override.
             handoff.provider_id = provider_id
@@ -102,3 +106,15 @@ class SubAgentOrchestrator:
             logger.info(f"Registered subagent handoff tool: {handoff.name}")
 
         self.handoffs = handoffs
+
+    def get_handoff(self, name: str) -> HandoffTool | None:
+        for handoff in self.handoffs:
+            if handoff.name == name and handoff.active:
+                return handoff
+        for handoff in self.handoffs:
+            if handoff.name == name:
+                return handoff
+        return None
+
+    def is_handoff_tool_name(self, name: str) -> bool:
+        return self.get_handoff(name) is not None

@@ -395,7 +395,9 @@ class TestScheduleJob:
         cron_manager._schedule_job(sample_cron_job)
 
         # Verify job was added to scheduler
-        assert cron_manager.scheduler.get_job("test-job-id") is not None
+        scheduled_job = cron_manager.scheduler.get_job("test-job-id")
+        assert scheduled_job is not None
+        assert scheduled_job.max_instances == 1
 
     @pytest.mark.asyncio
     async def test_schedule_job_uses_standard_crontab_weekday_numbers(
