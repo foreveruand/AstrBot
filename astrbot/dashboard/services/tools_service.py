@@ -4,6 +4,7 @@ import traceback
 from typing import Any
 
 from astrbot.core import logger, sp
+from astrbot.core.agent.handoff import HandoffTool
 from astrbot.core.agent.mcp_client import MCPTool, validate_mcp_stdio_config
 from astrbot.core.core_lifecycle import AstrBotCoreLifecycle
 from astrbot.core.star import star_map
@@ -254,6 +255,16 @@ class ToolsService:
             for tool in self.tool_mgr.iter_builtin_tools():
                 if tool.name not in existing_names:
                     tools.append(tool)
+                    existing_names.add(tool.name)
+
+            subagent_orchestrator = getattr(
+                self.core_lifecycle, "subagent_orchestrator", None
+            )
+            if subagent_orchestrator:
+                for tool in subagent_orchestrator.handoffs:
+                    if tool.name not in existing_names:
+                        tools.append(tool)
+                        existing_names.add(tool.name)
 
             config_entries = self._get_config_entries()
             tools_dict = []
@@ -541,6 +552,9 @@ class ToolsService:
         elif isinstance(tool, MCPTool):
             origin = "mcp"
             origin_name = tool.mcp_server_name
+        elif isinstance(tool, HandoffTool):
+            origin = "subagent"
+            origin_name = tool.agent.name
         elif tool.handler_module_path and star_map.get(tool.handler_module_path):
             star = star_map[tool.handler_module_path]
             origin = "plugin"

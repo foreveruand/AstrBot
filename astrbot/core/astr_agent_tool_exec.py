@@ -29,6 +29,8 @@ from astrbot.core.message.message_event_result import (
 )
 from astrbot.core.platform.message_session import MessageSession
 from astrbot.core.provider.entites import ProviderRequest
+from astrbot.core.provider.fallback import get_fallback_chat_providers
+from astrbot.core.provider.provider import Provider
 from astrbot.core.provider.register import llm_tools
 from astrbot.core.tools.computer_tools import (
     CuaKeyboardTypeTool,
@@ -52,6 +54,29 @@ from astrbot.core.utils.string_utils import normalize_and_dedupe_strings
 
 
 class FunctionToolExecutor(BaseFunctionToolExecutor[AstrAgentContext]):
+    @classmethod
+    def _is_handoff_tool_reference(
+        cls,
+        run_context: ContextWrapper[AstrAgentContext],
+        tool_name_or_obj: str | FunctionTool,
+    ) -> bool:
+        if isinstance(tool_name_or_obj, HandoffTool):
+            return True
+        if not isinstance(tool_name_or_obj, str):
+            return False
+        if tool_name_or_obj.startswith("transfer_to_"):
+            return True
+
+        orchestrator = getattr(
+            getattr(run_context.context, "context", None),
+            "subagent_orchestrator",
+            None,
+        )
+        if orchestrator is None:
+            return False
+        is_handoff_tool_name = getattr(orchestrator, "is_handoff_tool_name", None)
+        return bool(is_handoff_tool_name and is_handoff_tool_name(tool_name_or_obj))
+
     @classmethod
     def _collect_image_urls_from_args(cls, image_urls_raw: T.Any) -> list[str]:
         if image_urls_raw is None:
@@ -285,9 +310,15 @@ class FunctionToolExecutor(BaseFunctionToolExecutor[AstrAgentContext]):
 
         toolset = ToolSet()
         for tool_name_or_obj in tools:
+            if cls._is_handoff_tool_reference(run_context, tool_name_or_obj):
+                continue
             if isinstance(tool_name_or_obj, str):
                 registered_tool = llm_tools.get_func(tool_name_or_obj)
-                if registered_tool and registered_tool.active:
+                if (
+                    registered_tool
+                    and not isinstance(registered_tool, HandoffTool)
+                    and registered_tool.active
+                ):
                     toolset.add_tool(registered_tool)
                     continue
                 runtime_tool = runtime_computer_tools.get(tool_name_or_obj)
@@ -334,9 +365,26 @@ class FunctionToolExecutor(BaseFunctionToolExecutor[AstrAgentContext]):
 
         # Use per-subagent provider override if configured; otherwise fall back
         # to the current/default provider resolution.
-        prov_id = getattr(
-            tool, "provider_id", None
-        ) or await ctx.get_current_chat_provider_id(umo)
+        specified_provider_id = getattr(tool, "provider_id", None)
+        prov_id = specified_provider_id
+        if not prov_id:
+            get_extra = getattr(event, "get_extra", None)
+            selected_provider_id = (
+                get_extra("selected_provider") if callable(get_extra) else None
+            )
+            if isinstance(selected_provider_id, str):
+                selected_provider_id = selected_provider_id.strip() or None
+            else:
+                selected_provider_id = None
+            prov_id = selected_provider_id or await ctx.get_current_chat_provider_id(
+                umo
+            )
+
+        prov = ctx.get_provider_by_id(prov_id)
+        if not isinstance(prov, Provider):
+            raise ValueError(
+                f"Cannot resolve chat provider `{prov_id}` for handoff execution."
+            )
 
         # prepare begin dialogs
         contexts = None
@@ -353,9 +401,19 @@ class FunctionToolExecutor(BaseFunctionToolExecutor[AstrAgentContext]):
                 except Exception:
                     continue
 
-        prov_settings: dict = ctx.get_config(umo=umo).get("provider_settings", {})
+        run_extra = getattr(run_context.context, "extra", None)
+        prov_settings = (
+            run_extra.get("provider_settings") if isinstance(run_extra, dict) else None
+        )
+        if not isinstance(prov_settings, dict):
+            prov_settings = ctx.get_config(umo=umo).get("provider_settings", {})
         agent_max_step = int(prov_settings.get("max_agent_step", 30))
         stream = prov_settings.get("streaming_response", False)
+        fallback_providers = (
+            []
+            if specified_provider_id
+            else get_fallback_chat_providers(prov, ctx, prov_settings)
+        )
         llm_resp = await ctx.tool_loop_agent(
             event=event,
             chat_provider_id=prov_id,
@@ -367,6 +425,7 @@ class FunctionToolExecutor(BaseFunctionToolExecutor[AstrAgentContext]):
             max_steps=agent_max_step,
             tool_call_timeout=run_context.tool_call_timeout,
             stream=stream,
+            fallback_providers=fallback_providers,
         )
         yield mcp.types.CallToolResult(
             content=[mcp.types.TextContent(type="text", text=llm_resp.completion_text)]

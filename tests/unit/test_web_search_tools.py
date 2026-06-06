@@ -63,6 +63,41 @@ async def test_firecrawl_search_maps_web_results(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_tavily_search_ignores_date_range_when_time_range_is_set(monkeypatch):
+    async def fake_tavily_search(provider_settings, payload):
+        assert provider_settings["websearch_tavily_key"] == ["tavily-key"]
+        assert payload == {
+            "query": "AstrBot",
+            "max_results": 7,
+            "include_favicon": True,
+            "search_depth": "basic",
+            "topic": "general",
+            "time_range": "week",
+        }
+        return [
+            tools.SearchResult(
+                title="AstrBot",
+                url="https://example.com",
+                snippet="Search result",
+            )
+        ]
+
+    monkeypatch.setattr(tools, "_tavily_search", fake_tavily_search)
+    tool = tools.TavilyWebSearchTool()
+    context = _context_with_provider_settings({"websearch_tavily_key": ["tavily-key"]})
+
+    result = await tool.call(
+        context,
+        query="AstrBot",
+        time_range="week",
+        start_date="2026-05-01",
+        end_date="2026-05-07",
+    )
+
+    assert json.loads(result)["results"][0]["url"] == "https://example.com"
+
+
+@pytest.mark.asyncio
 async def test_firecrawl_search_maps_v2_data_list(monkeypatch):
     session = _FakeFirecrawlSession(
         _FakeFirecrawlResponse(

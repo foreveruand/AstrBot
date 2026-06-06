@@ -362,6 +362,9 @@ class BlockingSubagentContext:
     async def get_current_chat_provider_id(self, _umo: str) -> str:
         return "provider-id"
 
+    def get_provider_by_id(self, _provider_id: str):
+        return MockProvider()
+
     def get_config(self, **_kwargs):
         return {"provider_settings": {}}
 
@@ -1378,6 +1381,13 @@ async def test_follow_up_accepted_when_active_and_not_stopping(
         agent_hooks=mock_hooks,
         streaming=False,
     )
+    ticket = runner.follow_up(message_text="valid follow-up message")
+    assert ticket is not None, (
+        "Follow-up should be accepted when runner is active and not stopping"
+    )
+    assert ticket.text == "valid follow-up message"
+    assert ticket.consumed is False
+    assert ticket in runner._pending_follow_ups
 
 
 @pytest.mark.asyncio

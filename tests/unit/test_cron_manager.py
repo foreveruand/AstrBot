@@ -1,5 +1,6 @@
 """Tests for CronJobManager."""
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
@@ -67,6 +68,7 @@ class TestCronJobManagerInit:
         manager = CronJobManager(mock_db)
 
         assert manager.db == mock_db
+        assert manager.running_timeout == 1800
         assert manager._basic_handlers == {}
         assert manager._started is False
 
@@ -395,7 +397,9 @@ class TestScheduleJob:
         cron_manager._schedule_job(sample_cron_job)
 
         # Verify job was added to scheduler
-        assert cron_manager.scheduler.get_job("test-job-id") is not None
+        scheduled_job = cron_manager.scheduler.get_job("test-job-id")
+        assert scheduled_job is not None
+        assert scheduled_job.max_instances == 1
 
     @pytest.mark.asyncio
     async def test_schedule_job_uses_standard_crontab_weekday_numbers(
@@ -498,6 +502,33 @@ class TestRunJob:
 
         # Should not update status
         mock_db.update_cron_job.assert_not_called()
+
+
+class TestRunJobTimeout:
+    """Tests for cron job timeout handling."""
+
+    @pytest.mark.asyncio
+    async def test_run_job_times_out(self, mock_db, sample_cron_job):
+        """Test timing out a cron job updates status and error."""
+        sample_cron_job.job_type = "basic"
+        mock_db.get_cron_job.return_value = sample_cron_job
+
+        async def slow_handler(**_kwargs):
+            await asyncio.sleep(0.05)
+
+        cron_manager = CronJobManager(mock_db, running_timeout=0.01)
+        cron_manager._basic_handlers["test-job-id"] = slow_handler
+
+        await cron_manager._run_job("test-job-id")
+
+        assert mock_db.update_cron_job.await_count == 2
+        final_call = mock_db.update_cron_job.await_args_list[-1]
+        assert final_call.args == ("test-job-id",)
+        assert final_call.kwargs["status"] == "failed"
+        assert (
+            final_call.kwargs["last_error"]
+            == "Cron job exceeded timeout of 0.01 seconds."
+        )
 
 
 class TestRunBasicJob:
