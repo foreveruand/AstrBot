@@ -30,6 +30,17 @@ class LLMMetadata(TypedDict):
 LLM_METADATAS: dict[str, LLMMetadata] = {}
 
 
+def get_llm_metadata(model_id: str) -> LLMMetadata | None:
+    """Get model metadata, accepting provider-prefixed model IDs."""
+    if model_info := LLM_METADATAS.get(model_id):
+        return model_info
+
+    normalized_model_id = model_id.rsplit("/", 1)[-1]
+    if normalized_model_id == model_id:
+        return None
+    return LLM_METADATAS.get(normalized_model_id)
+
+
 async def update_llm_metadata() -> None:
     url = "https://models.dev/api.json"
     try:
