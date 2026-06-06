@@ -33,7 +33,7 @@
   },
   "description": {
     "disabled": "When off: SubAgent is disabled; the main LLM mounts tools via persona rules (all by default) and calls them directly.",
-    "enabled": "When on: the main LLM keeps its own tools and mounts transfer_to_* delegate tools. With deduplication, tools overlapping with SubAgents are removed from the main tool set."
+    "enabled": "When on: the main LLM can use transfer_to_* delegate tools selected by the active persona. With deduplication, tools overlapping with selected SubAgents are removed from the main tool set."
   },
   "section": {
     "title": "SubAgents",
