@@ -96,6 +96,15 @@ def calculate_metrics(user_id: int, force_refresh: bool = False) -> dict:
 ```
 
 
+## Plugin development requirements
+
+1. **Repository scope**: Plugin code changes must NOT be committed to the AstrBot root repository. Only commit changes within the plugin's own directory/repository.
+2. **Documentation updates**: When implementing feature improvements or bug fixes, you MUST update the following files in the plugin directory:
+   - `CHANGELOG.md` - Document the changes
+   - `README.md` - Update usage instructions if affected
+   - `metadata.yaml` - Update the version number
+   - `_conf_schema.json` or configuration files - Update if configuration options changed
+
 ## PR instructions
 
 1. Title format: use conventional commit messages

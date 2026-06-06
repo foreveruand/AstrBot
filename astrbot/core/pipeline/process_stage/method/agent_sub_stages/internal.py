@@ -289,6 +289,7 @@ class InternalAgentSubStage(Stage):
                             "model": provider.get_model(),
                         },
                     )
+                    event.set_extra("current_chat_model", provider.get_model())
 
                     # 检测 Live Mode
                     if action_type == "live":

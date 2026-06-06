@@ -42,6 +42,8 @@ Click the "Add SubAgent" button:
 - **Assign Tools**: Select the tools this SubAgent can invoke.
 - **Provider Override (Optional)**: You can specify different model providers for specific SubAgents. For example, the Main Agent could use GPT-4o, while a simple query SubAgent uses GPT-4o-mini to save costs.
 
+> Note: if a SubAgent has an explicit `Provider` override, it will use that `Provider` directly and will not use fallback providers. Fallback only applies when no `Provider` is specified, in which case AstrBot first uses the current conversation's Main Agent provider and falls back only on failure.
+
 ## Best Practices
 
 - **Single Responsibility**: Each SubAgent should handle one category of related tasks (e.g., search, file processing, smart home control).
