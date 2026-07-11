@@ -1,6 +1,7 @@
 import asyncio
 import importlib
 import sys
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -226,6 +227,35 @@ async def test_telegram_final_segment_splits_long_plaintext_when_markdown_fails(
     assert len(second_call["text"]) == 18
     assert "parse_mode" not in first_call
     assert "parse_mode" not in second_call
+
+
+@pytest.mark.asyncio
+async def test_telegram_tool_call_status_is_edited_after_first_send():
+    TelegramPlatformEvent = _load_telegram_platform_event()
+    client = MagicMock()
+    client.send_message = AsyncMock(return_value=SimpleNamespace(message_id=42))
+    client.edit_message_text = AsyncMock()
+    message = MagicMock()
+    message.type = "FriendMessage"
+    message.sender.user_id = "123456"
+    event = TelegramPlatformEvent("msg", message, MagicMock(), "session", client)
+
+    first_sent = await event.update_tool_call_status(
+        MessageChain().message("🔨 调用工具: astrbot_execute_shell")
+    )
+    second_sent = await event.update_tool_call_status(
+        MessageChain().message("🔨 调用工具: astrbot_execute_shell 2次")
+    )
+
+    assert first_sent is True
+    assert second_sent is False
+    assert client.send_message.await_count == 1
+    assert client.edit_message_text.await_args.kwargs == {
+        "chat_id": "123456",
+        "message_id": 42,
+        "text": "🔨 调用工具: astrbot_execute_shell 2次",
+        "parse_mode": "MarkdownV2",
+    }
 
 
 @pytest.mark.asyncio

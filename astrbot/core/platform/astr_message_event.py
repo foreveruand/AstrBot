@@ -491,6 +491,25 @@ class AstrMessageEvent(abc.ABC):
         )
         self._has_send_oper = True
 
+    async def update_tool_call_status(self, message: MessageChain) -> bool:
+        """Update the current tool-call status message when the platform supports it.
+
+        Args:
+            message: The merged tool-call status message.
+
+        Returns:
+            Whether a new status message was sent.
+        """
+        _ = message
+        return False
+
+    def supports_tool_call_status_update(self) -> bool:
+        """Return whether the platform can update a sent tool-call status message."""
+        return False
+
+    def clear_tool_call_status(self) -> None:
+        """Clear the platform-specific tool-call status message state."""
+
     async def react(self, emoji: str) -> None:
         """对消息添加表情回应。
 

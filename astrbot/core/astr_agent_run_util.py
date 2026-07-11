@@ -65,6 +65,16 @@ def _build_tool_call_status_message(tool_info: dict | None) -> str:
     return "🔨 调用工具..."
 
 
+def _build_merged_tool_call_status_message(tool_call_counts: dict[str, int]) -> str:
+    lines = []
+    for tool_name, count in tool_call_counts.items():
+        status_msg = f"🔨 调用工具: {tool_name}"
+        if count > 1:
+            status_msg = f"{status_msg} {count}次"
+        lines.append(status_msg)
+    return "\n".join(lines)
+
+
 def _build_tool_result_status_message(
     msg_chain: MessageChain, tool_name_by_call_id: dict[str, str]
 ) -> str:
@@ -125,12 +135,32 @@ async def run_agent(
     step_idx = 0
     astr_event = agent_runner.run_context.context.event
     tool_name_by_call_id: dict[str, str] = {}
+    tool_call_counts: dict[str, int] = {}
+    tool_call_status_sent = False
     buffered_llm_chains: list[MessageChain] = []
     can_buffer_llm_result = _should_buffer_llm_result(
         buffer_intermediate_messages,
         stream_to_general,
         agent_runner,
     )
+
+    async def flush_tool_call_status() -> MessageChain | None:
+        nonlocal tool_call_status_sent
+        if not tool_call_counts:
+            return None
+
+        status_chain = MessageChain(type="tool_call").message(
+            _build_merged_tool_call_status_message(tool_call_counts)
+        )
+        if not tool_call_status_sent:
+            await astr_event.send(status_chain)
+        astr_event.clear_tool_call_status()
+        tool_call_counts.clear()
+        tool_call_status_sent = False
+        if agent_runner.streaming:
+            return MessageChain(chain=[], type="break")
+        return None
+
     while step_idx < max_step + 1:
         step_idx += 1
 
@@ -214,15 +244,6 @@ async def run_agent(
                     # 对于其他情况，暂时先不处理
                     continue
                 elif resp.type == "tool_call":
-                    if agent_runner.streaming and show_tool_use:
-                        # 向下游平台发送 "break" 分段信号（空 MessageChain，不携带数据）。
-                        # 平台适配器收到后会关闭当前流式消息，并在后续文本到来时创建新消息。
-                        # 仅在 show_tool_use 为 True 时才发送：此时紧接着会通过
-                        # astr_event.send() 独立发送工具状态消息（如"🔨 调用工具: xxx"），
-                        # 需要分段才能保证消息顺序正确。
-                        # 若 show_tool_use 为 False，不会有独立消息插入，无需分段。
-                        yield MessageChain(chain=[], type="break")
-
                     tool_info = _extract_chain_json_data(resp.data["chain"])
                     astr_event.trace.record(
                         "agent_tool_call",
@@ -236,10 +257,27 @@ async def run_agent(
                         if show_tool_call_result and isinstance(tool_info, dict):
                             # Delay tool status notification until tool_call_result.
                             continue
-                        chain = MessageChain(type="tool_call").message(
-                            _build_tool_call_status_message(tool_info)
+                        tool_name = (
+                            str(tool_info.get("name", "unknown"))
+                            if isinstance(tool_info, dict)
+                            else "unknown"
                         )
-                        await astr_event.send(chain)
+                        is_new_status = not tool_call_counts
+                        tool_call_counts[tool_name] = (
+                            tool_call_counts.get(tool_name, 0) + 1
+                        )
+                        chain = MessageChain(type="tool_call").message(
+                            _build_merged_tool_call_status_message(tool_call_counts)
+                        )
+                        if astr_event.supports_tool_call_status_update():
+                            if agent_runner.streaming and is_new_status:
+                                # Close the current streaming segment before Telegram
+                                # sends the editable status message.
+                                yield MessageChain(chain=[], type="break")
+                            tool_call_status_sent = (
+                                await astr_event.update_tool_call_status(chain)
+                                or tool_call_status_sent
+                            )
                     continue
                 elif resp.type == "llm_result":
                     chain = resp.data["chain"]
@@ -247,6 +285,8 @@ async def run_agent(
                         # For non-streaming mode, we handle reasoning in astrbot/core/astr_agent_hooks.py.
                         # For streaming mode, we yield content immediately when received a reasoning chunk but not in here, see below.
                         continue
+                    if break_chain := await flush_tool_call_status():
+                        yield break_chain
 
                 if stream_to_general and resp.type == "streaming_delta":
                     continue
@@ -292,6 +332,8 @@ async def run_agent(
                     if chain.type == "reasoning" and not show_reasoning:
                         # display the reasoning content only when configured
                         continue
+                    if break_chain := await flush_tool_call_status():
+                        yield break_chain
                     yield resp.data["chain"]  # MessageChain
 
             if can_buffer_llm_result and agent_runner.done():

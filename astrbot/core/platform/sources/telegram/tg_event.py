@@ -96,6 +96,9 @@ class TelegramPlatformEvent(AstrMessageEvent):
     ) -> None:
         super().__init__(message_str, message_obj, platform_meta, session_id)
         self.client = client
+        self._tool_call_status_chat_id: str | None = None
+        self._tool_call_status_message_id: int | None = None
+        self._tool_call_status_thread_id: str | None = None
 
     @classmethod
     def _split_message(cls, text: str, max_length: int | None = None) -> list[str]:
@@ -687,6 +690,72 @@ class TelegramPlatformEvent(AstrMessageEvent):
         else:
             await self.send_with_client(self.client, message, self.get_sender_id())
         await super().send(message)
+
+    def supports_tool_call_status_update(self) -> bool:
+        """Return whether Telegram can edit a sent tool-call status message."""
+        return True
+
+    async def update_tool_call_status(self, message: MessageChain) -> bool:
+        """Send or edit the current tool-call status message.
+
+        Args:
+            message: The merged tool-call status message.
+
+        Returns:
+            Whether a new status message was sent.
+        """
+        text = message.get_plain_text(with_other_comps_mark=True)
+        if not text:
+            return False
+
+        if self._tool_call_status_message_id is not None:
+            try:
+                await self.client.edit_message_text(
+                    chat_id=self._tool_call_status_chat_id,
+                    message_id=self._tool_call_status_message_id,
+                    text=telegramify_markdown.markdownify(text),
+                    parse_mode="MarkdownV2",
+                )
+                return False
+            except Exception as e:
+                logger.warning("Failed to edit tool-call status message: %s", e)
+                self.clear_tool_call_status()
+
+        if self.get_message_type() == MessageType.GROUP_MESSAGE:
+            chat_id = self.message_obj.group_id
+        else:
+            chat_id = self.get_sender_id()
+        message_thread_id = None
+        if "#" in chat_id:
+            chat_id, message_thread_id = chat_id.split("#", maxsplit=1)
+
+        payload: dict[str, Any] = {"chat_id": chat_id}
+        if message_thread_id:
+            payload["message_thread_id"] = message_thread_id
+        try:
+            sent_message = await self.client.send_message(
+                text=telegramify_markdown.markdownify(text),
+                parse_mode="MarkdownV2",
+                **cast(Any, payload),
+            )
+        except Exception as e:
+            logger.warning("Failed to send formatted tool-call status message: %s", e)
+            sent_message = await self.client.send_message(
+                text=text,
+                **cast(Any, payload),
+            )
+
+        self._tool_call_status_chat_id = chat_id
+        self._tool_call_status_message_id = sent_message.message_id
+        self._tool_call_status_thread_id = message_thread_id
+        await super().send(message)
+        return True
+
+    def clear_tool_call_status(self) -> None:
+        """Clear the current editable tool-call status message reference."""
+        self._tool_call_status_chat_id = None
+        self._tool_call_status_message_id = None
+        self._tool_call_status_thread_id = None
 
     async def react(self, emoji: str | None, big: bool = False) -> None:
         """给原消息添加 Telegram 反应：
