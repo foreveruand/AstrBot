@@ -59,6 +59,13 @@ def create_mock_telegram_modules():
     # Mock telegramify_markdown
     mock_telegramify = MagicMock()
     mock_telegramify.markdownify = lambda text, **kwargs: text
+    import telegramify_markdown as real_telegramify_markdown
+
+    mock_telegramify.convert = real_telegramify_markdown.convert
+    mock_telegramify.split_entities = real_telegramify_markdown.split_entities
+    mock_telegramify.entities_to_markdownv2 = (
+        real_telegramify_markdown.entities_to_markdownv2
+    )
 
     # Mock apscheduler
     mock_apscheduler = MagicMock()

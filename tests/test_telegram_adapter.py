@@ -1,6 +1,7 @@
 import asyncio
 import importlib
 import sys
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -425,7 +426,7 @@ async def test_telegram_final_segment_splits_long_plaintext_when_markdown_fails(
     payload = {"chat_id": "123456"}
 
     with patch(
-        "astrbot.core.platform.sources.telegram.tg_event.telegramify_markdown.markdownify",
+        "astrbot.core.platform.sources.telegram.tg_event.telegramify_markdown.convert",
         side_effect=Exception("boom"),
     ):
         await event._send_final_segment(delta, payload)
@@ -437,6 +438,113 @@ async def test_telegram_final_segment_splits_long_plaintext_when_markdown_fails(
     assert len(second_call["text"]) == 18
     assert "parse_mode" not in first_call
     assert "parse_mode" not in second_call
+
+
+@pytest.mark.asyncio
+async def test_telegram_final_segment_closes_entities_at_chunk_boundaries():
+    TelegramPlatformEvent = _load_telegram_platform_event()
+    client = MagicMock()
+    client.send_message = AsyncMock()
+    event = TelegramPlatformEvent("msg", MagicMock(), MagicMock(), "session", client)
+
+    delta = "# " + "U" * (TelegramPlatformEvent.MAX_MESSAGE_LENGTH + 24)
+    payload = {"chat_id": "123456"}
+
+    await event._send_final_segment(delta, payload)
+
+    assert client.send_message.await_count == 2
+    for call in client.send_message.await_args_list:
+        text = call.kwargs["text"]
+        assert call.kwargs["parse_mode"] == "MarkdownV2"
+        assert text.count("__") % 2 == 0
+        assert text.count("*") % 2 == 0
+
+
+@pytest.mark.asyncio
+async def test_telegram_caption_closes_entities_at_caption_boundary():
+    TelegramPlatformEvent = _load_telegram_platform_event()
+    client = MagicMock()
+    client.send_chat_action = AsyncMock()
+    client.send_photo = AsyncMock()
+    client.send_message = AsyncMock()
+
+    message = MessageChain().message(
+        "# " + "U" * (TelegramPlatformEvent.MAX_CAPTION_LENGTH + 24)
+    )
+    message.chain.append(Comp.Image.fromURL("https://example.com/caption.jpg"))
+
+    with patch.object(
+        Comp.Image,
+        "convert_to_file_path",
+        AsyncMock(return_value="/tmp/caption.jpg"),
+    ):
+        await TelegramPlatformEvent.send_with_client(client, message, "123456")
+
+    assert client.send_photo.await_count == 1
+    photo_call = client.send_photo.await_args.kwargs
+    assert photo_call["parse_mode"] == "MarkdownV2"
+    assert photo_call["caption"].count("__") % 2 == 0
+    assert photo_call["caption"].count("*") % 2 == 0
+    assert client.send_message.await_count == 1
+    followup = client.send_message.await_args.kwargs
+    assert followup["parse_mode"] == "MarkdownV2"
+
+
+@pytest.mark.asyncio
+async def test_telegram_caption_retries_as_plain_text_after_markdown_rejection():
+    TelegramPlatformEvent = _load_telegram_platform_event()
+    client = MagicMock()
+    client.send_chat_action = AsyncMock()
+    client.send_photo = AsyncMock(
+        side_effect=[Exception("can't find end of underline entity"), None]
+    )
+    client.send_document = AsyncMock()
+
+    message = MessageChain().message("**标题!*无人声**")
+    message.chain.append(Comp.Image.fromURL("https://example.com/rejected.jpg"))
+
+    with patch.object(
+        Comp.Image,
+        "convert_to_file_path",
+        AsyncMock(return_value="/tmp/rejected.jpg"),
+    ):
+        await TelegramPlatformEvent.send_with_client(client, message, "123456")
+
+    assert client.send_photo.await_count == 2
+    formatted_call, plain_call = client.send_photo.await_args_list
+    assert formatted_call.kwargs["parse_mode"] == "MarkdownV2"
+    assert "parse_mode" not in plain_call.kwargs
+    assert plain_call.kwargs["caption"] == "*标题!无人声"
+    assert client.send_document.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_telegram_tool_call_status_is_edited_after_first_send():
+    TelegramPlatformEvent = _load_telegram_platform_event()
+    client = MagicMock()
+    client.send_message = AsyncMock(return_value=SimpleNamespace(message_id=42))
+    client.edit_message_text = AsyncMock()
+    message = MagicMock()
+    message.type = "FriendMessage"
+    message.sender.user_id = "123456"
+    event = TelegramPlatformEvent("msg", message, MagicMock(), "session", client)
+
+    first_sent = await event.update_tool_call_status(
+        MessageChain().message("🔨 调用工具: astrbot_execute_shell")
+    )
+    second_sent = await event.update_tool_call_status(
+        MessageChain().message("🔨 调用工具: astrbot_execute_shell 2次")
+    )
+
+    assert first_sent is True
+    assert second_sent is False
+    assert client.send_message.await_count == 1
+    assert client.edit_message_text.await_args.kwargs == {
+        "chat_id": "123456",
+        "message_id": 42,
+        "text": "🔨 调用工具: astrbot\\_execute\\_shell 2次",
+        "parse_mode": "MarkdownV2",
+    }
 
 
 @pytest.mark.asyncio
