@@ -96,21 +96,46 @@ class TelegramPlatformEvent(AstrMessageEvent):
     ) -> None:
         super().__init__(message_str, message_obj, platform_meta, session_id)
         self.client = client
+        self._tool_call_status_chat_id: str | None = None
+        self._tool_call_status_message_id: int | None = None
+        self._tool_call_status_thread_id: str | None = None
+
+    @staticmethod
+    def _utf16_length(text: str) -> int:
+        """Return text length in Telegram's UTF-16 code units.
+
+        Args:
+            text: Text to measure.
+
+        Returns:
+            The number of UTF-16 code units in ``text``.
+        """
+        return len(text.encode("utf-16-le")) // 2
 
     @classmethod
     def _split_message(cls, text: str, max_length: int | None = None) -> list[str]:
         limit = max_length or cls.MAX_MESSAGE_LENGTH
-        if len(text) <= limit:
+        if cls._utf16_length(text) <= limit:
             return [text]
 
         chunks = []
         while text:
-            if len(text) <= limit:
+            if cls._utf16_length(text) <= limit:
                 chunks.append(text)
                 break
 
-            split_point = limit
-            segment = text[:limit]
+            split_point = 0
+            utf16_length = 0
+            for index, char in enumerate(text):
+                char_length = 2 if ord(char) > 0xFFFF else 1
+                if utf16_length + char_length > limit:
+                    break
+                utf16_length += char_length
+                split_point = index + 1
+
+            if split_point == 0:
+                split_point = 1
+            segment = text[:split_point]
 
             for _, pattern in cls.SPLIT_PATTERNS.items():
                 if matches := list(pattern.finditer(segment)):
@@ -124,17 +149,84 @@ class TelegramPlatformEvent(AstrMessageEvent):
         return chunks
 
     @classmethod
-    def _split_caption_text(cls, text: str | None) -> tuple[str | None, str | None]:
-        if not text:
-            return None, None
+    def _prepare_text_chunks(
+        cls, text: str, max_length: int | None = None
+    ) -> list[tuple[str, str | None]]:
+        """Convert Markdown and split it without breaking Telegram entities.
 
-        caption = text[: cls.MAX_CAPTION_LENGTH]
-        remaining_text = (
-            text[cls.MAX_CAPTION_LENGTH :]
-            if len(text) > cls.MAX_CAPTION_LENGTH
-            else None
-        )
-        return caption, remaining_text
+        Args:
+            text: Markdown source text.
+            max_length: Maximum rendered UTF-16 length of each chunk.
+
+        Returns:
+            A list of ``(formatted_text, plain_text)`` pairs. ``plain_text`` is
+            available as a fallback when Telegram rejects the formatted chunk;
+            it is ``None`` when Markdown conversion itself failed.
+        """
+        if not text:
+            return []
+
+        limit = max_length or cls.MAX_MESSAGE_LENGTH
+        try:
+            plain_text, entities = telegramify_markdown.convert(text)
+            entity_chunks = telegramify_markdown.split_entities(
+                plain_text,
+                entities,
+                limit,
+            )
+            return [
+                (
+                    telegramify_markdown.entities_to_markdownv2(
+                        chunk_text,
+                        chunk_entities,
+                    ),
+                    chunk_text,
+                )
+                for chunk_text, chunk_entities in entity_chunks
+            ]
+        except Exception as e:
+            logger.warning(
+                f"Telegram Markdown conversion failed; using plain text: {e!s}"
+            )
+            return [(chunk, None) for chunk in cls._split_message(text, limit)]
+
+    @classmethod
+    async def _send_prepared_text_chunks(
+        cls,
+        client: ExtBot,
+        chunks: list[tuple[str, str | None]],
+        payload: dict[str, Any],
+    ) -> None:
+        """Send prepared chunks with MarkdownV2 and plain-text fallback.
+
+        Args:
+            client: Telegram bot client.
+            chunks: Prepared ``(formatted_text, plain_text)`` pairs.
+            payload: Common Telegram message parameters.
+        """
+        for formatted_text, plain_text in chunks:
+            if not formatted_text:
+                continue
+            try:
+                if plain_text is None:
+                    await client.send_message(
+                        text=formatted_text,
+                        **cast(Any, payload),
+                    )
+                else:
+                    await client.send_message(
+                        text=formatted_text,
+                        parse_mode="MarkdownV2",
+                        **cast(Any, payload),
+                    )
+            except (ValueError, BadRequest) as e:
+                logger.warning(
+                    f"Telegram MarkdownV2 send failed; using plain text: {e!s}"
+                )
+                await client.send_message(
+                    text=plain_text or formatted_text,
+                    **cast(Any, payload),
+                )
 
     @classmethod
     async def _send_text_chunks(
@@ -142,23 +234,21 @@ class TelegramPlatformEvent(AstrMessageEvent):
         client: ExtBot,
         text: str,
         payload: dict[str, Any],
+        max_length: int | None = None,
     ) -> None:
-        """按 Telegram 限制切分文本后逐段发送。"""
-        for chunk in cls._split_message(text, cls.MAX_MESSAGE_LENGTH):
-            try:
-                markdown_text = telegramify_markdown.markdownify(
-                    chunk,
-                )
-                await client.send_message(
-                    text=markdown_text,
-                    parse_mode="MarkdownV2",
-                    **cast(Any, payload),
-                )
-            except (ValueError, BadRequest) as e:
-                logger.warning(
-                    f"Failed to convert message to Markdown，using normal text: {e!s}"
-                )
-                await client.send_message(text=chunk, **cast(Any, payload))
+        """Split and send text while preserving Markdown entity boundaries.
+
+        Args:
+            client: Telegram bot client.
+            text: Markdown source text.
+            payload: Common Telegram message parameters.
+            max_length: Maximum rendered UTF-16 length of each chunk.
+        """
+        await cls._send_prepared_text_chunks(
+            client,
+            cls._prepare_text_chunks(text, max_length),
+            payload,
+        )
 
     @classmethod
     async def _send_chat_action(
@@ -210,6 +300,38 @@ class TelegramPlatformEvent(AstrMessageEvent):
         await cls._send_chat_action(
             client, user_name, ChatAction.TYPING, effective_thread_id
         )
+
+    @classmethod
+    async def _send_media_with_caption_fallback(
+        cls,
+        send_coro: Callable[..., Any],
+        payload: dict[str, Any],
+        caption_fallback: str | None,
+    ) -> None:
+        """Retry a formatted media caption as plain text after a parse failure.
+
+        Args:
+            send_coro: Telegram media send coroutine.
+            payload: Media send parameters, including the optional caption.
+            caption_fallback: Plain caption to use when MarkdownV2 is rejected.
+
+        Raises:
+            ValueError: If Telegram rejects the formatted request and no plain
+                caption fallback is available.
+            BadRequest: If Telegram rejects both the formatted and plain requests.
+        """
+        try:
+            await send_coro(**cast(Any, payload))
+        except (ValueError, BadRequest) as e:
+            if caption_fallback is None or payload.get("parse_mode") != "MarkdownV2":
+                raise
+            logger.warning(
+                f"Telegram media caption parsing failed; retrying as plain text: {e!s}"
+            )
+            fallback_payload = dict(payload)
+            fallback_payload.pop("parse_mode", None)
+            fallback_payload["caption"] = caption_fallback
+            await send_coro(**cast(Any, fallback_payload))
 
     @classmethod
     async def _send_voice_with_fallback(
@@ -294,8 +416,20 @@ class TelegramPlatformEvent(AstrMessageEvent):
         user_name: str = "",
         message_thread_id: str | None = None,
         use_media_action: bool = False,
+        caption_fallback: str | None = None,
     ) -> None:
-        """Send a Telegram photo, falling back to a document if Telegram rejects it."""
+        """Send a Telegram photo with caption and document fallbacks.
+
+        Args:
+            client: Telegram bot client.
+            path: Local photo path used for document fallback logging.
+            payload: Common Telegram request parameters.
+            photo_kwargs: Photo request parameters.
+            user_name: Target user or group ID used for chat actions.
+            message_thread_id: Optional Telegram topic ID.
+            use_media_action: Whether to show upload actions around the send.
+            caption_fallback: Plain caption used when MarkdownV2 is rejected.
+        """
         try:
             if use_media_action:
                 await cls._send_media_with_action(
@@ -311,8 +445,40 @@ class TelegramPlatformEvent(AstrMessageEvent):
                 await client.send_photo(**photo_kwargs, **cast(Any, payload))
             return
         except BadRequest as e:
+            if (
+                caption_fallback is not None
+                and payload.get("parse_mode") == "MarkdownV2"
+                and not cls._is_photo_recoverable_error(e)
+            ):
+                fallback_payload = dict(payload)
+                fallback_payload.pop("parse_mode", None)
+                fallback_photo_kwargs = dict(photo_kwargs)
+                fallback_photo_kwargs["caption"] = caption_fallback
+                logger.warning(
+                    f"Telegram photo caption parsing failed; retrying as plain text: {e!s}"
+                )
+                try:
+                    if use_media_action:
+                        await cls._send_media_with_action(
+                            client,
+                            ChatAction.UPLOAD_PHOTO,
+                            client.send_photo,
+                            user_name=user_name,
+                            message_thread_id=message_thread_id,
+                            **fallback_photo_kwargs,
+                            **cast(Any, fallback_payload),
+                        )
+                    else:
+                        await client.send_photo(
+                            **fallback_photo_kwargs,
+                            **cast(Any, fallback_payload),
+                        )
+                    return
+                except BadRequest:
+                    pass
+
             if not cls._is_photo_recoverable_error(e):
-                raise
+                raise e
 
         logger.warning(
             "Telegram rejected photo send for %s, falling back to document",
@@ -326,7 +492,10 @@ class TelegramPlatformEvent(AstrMessageEvent):
             "document": path,
             "filename": filename,
         }
-        if caption := photo_kwargs.get("caption"):
+        if caption_fallback is not None:
+            document_kwargs["caption"] = caption_fallback
+            document_payload.pop("parse_mode", None)
+        elif caption := photo_kwargs.get("caption"):
             document_kwargs["caption"] = caption
 
         if use_media_action:
@@ -448,25 +617,27 @@ class TelegramPlatformEvent(AstrMessageEvent):
                 image_path = await img.convert_to_file_path()
                 image_infos.append((image_path, img.use_spoiler, _is_gif(image_path)))
 
-            first_caption, remaining_text = cls._split_caption_text(full_text)
-            caption_text: str | None = None
-            caption_parse_mode: str | None = None
-            if first_caption:
-                try:
-                    caption_text = telegramify_markdown.markdownify(first_caption)
-                    caption_parse_mode = "MarkdownV2"
-                except Exception as e:
-                    logger.warning(f"Caption markdownify failed: {e}, using plain text")
-                    caption_text = first_caption
+            caption_chunks = cls._prepare_text_chunks(
+                full_text or "",
+                cls.MAX_CAPTION_LENGTH,
+            )
+            caption_text = caption_chunks[0][0] if caption_chunks else None
+            caption_parse_mode = (
+                "MarkdownV2"
+                if caption_chunks and caption_chunks[0][1] is not None
+                else None
+            )
+            caption_fallback = caption_chunks[0][1] if caption_chunks else None
+            remaining_text_chunks = caption_chunks[1:]
 
             caption_sent = False
 
-            def _caption_for_next_media() -> tuple[str | None, str | None]:
+            def _caption_for_next_media() -> tuple[str | None, str | None, str | None]:
                 nonlocal caption_sent
                 if caption_sent or not caption_text:
-                    return None, None
+                    return None, None, None
                 caption_sent = True
-                return caption_text, caption_parse_mode
+                return caption_text, caption_parse_mode, caption_fallback
 
             async def _send_photo_batch(batch: list[tuple[str, bool, bool]]) -> None:
                 if not batch:
@@ -481,8 +652,13 @@ class TelegramPlatformEvent(AstrMessageEvent):
                         media: list[InputMediaPhoto] = []
                         group_caption: str | None = None
                         group_parse_mode: str | None = None
+                        group_caption_fallback: str | None = None
                         if batch_start == 0:
-                            group_caption, group_parse_mode = _caption_for_next_media()
+                            (
+                                group_caption,
+                                group_parse_mode,
+                                group_caption_fallback,
+                            ) = _caption_for_next_media()
 
                         for idx, (img_path, use_spoiler, _) in enumerate(group):
                             photo_kwargs: dict[str, Any] = {
@@ -519,6 +695,7 @@ class TelegramPlatformEvent(AstrMessageEvent):
                                     img_path,
                                     photo_payload,
                                     photo_kwargs,
+                                    caption_fallback=group_caption_fallback,
                                 )
                 else:
                     only_path, only_spoiler, _ = batch[0]
@@ -527,7 +704,11 @@ class TelegramPlatformEvent(AstrMessageEvent):
                         "photo": only_path,
                         "has_spoiler": only_spoiler,
                     }
-                    single_caption, single_parse_mode = _caption_for_next_media()
+                    (
+                        single_caption,
+                        single_parse_mode,
+                        single_caption_fallback,
+                    ) = _caption_for_next_media()
                     if single_caption:
                         photo_kwargs["caption"] = single_caption
                         if single_parse_mode:
@@ -537,6 +718,7 @@ class TelegramPlatformEvent(AstrMessageEvent):
                         only_path,
                         payload,
                         photo_kwargs,
+                        caption_fallback=single_caption_fallback,
                     )
 
             pending_photos: list[tuple[str, bool, bool]] = []
@@ -548,14 +730,21 @@ class TelegramPlatformEvent(AstrMessageEvent):
                 for image_path, _, _ in [info for info in image_infos if info[2]]:
                     payload = get_base_payload()
                     animation_kwargs: dict[str, Any] = {"animation": image_path}
-                    gif_caption, gif_parse_mode = _caption_for_next_media()
+                    (
+                        gif_caption,
+                        gif_parse_mode,
+                        gif_caption_fallback,
+                    ) = _caption_for_next_media()
                     if gif_caption:
                         animation_kwargs["caption"] = gif_caption
                         if gif_parse_mode:
                             payload["parse_mode"] = gif_parse_mode
-                    await client.send_animation(
-                        **animation_kwargs,
-                        **cast(Any, payload),
+                    animation_payload = dict(payload)
+                    animation_payload.update(animation_kwargs)
+                    await cls._send_media_with_caption_fallback(
+                        client.send_animation,
+                        animation_payload,
+                        gif_caption_fallback,
                     )
             elif len(image_infos) >= 2:
                 await _send_photo_batch(image_infos)
@@ -565,102 +754,97 @@ class TelegramPlatformEvent(AstrMessageEvent):
 
                 if first_is_gif:
                     animation_kwargs: dict[str, Any] = {"animation": first_image_path}
-                    gif_caption, gif_parse_mode = _caption_for_next_media()
+                    (
+                        gif_caption,
+                        gif_parse_mode,
+                        gif_caption_fallback,
+                    ) = _caption_for_next_media()
                     if gif_caption:
                         animation_kwargs["caption"] = gif_caption
                         if gif_parse_mode:
                             payload["parse_mode"] = gif_parse_mode
-                    await client.send_animation(
-                        **animation_kwargs,
-                        **cast(Any, payload),
+                    animation_payload = dict(payload)
+                    animation_payload.update(animation_kwargs)
+                    await cls._send_media_with_caption_fallback(
+                        client.send_animation,
+                        animation_payload,
+                        gif_caption_fallback,
                     )
-                    remaining_text = full_text if not caption_sent else remaining_text
+                    if not caption_sent and full_text:
+                        remaining_text_chunks = cls._prepare_text_chunks(full_text)
                 else:
                     await _send_photo_batch([(first_image_path, first_spoiler, False)])
 
-            if remaining_text:
-                chunks = cls._split_message(remaining_text, cls.MAX_MESSAGE_LENGTH)
-                for chunk in chunks:
-                    payload = get_base_payload()
-                    payload["disable_web_page_preview"] = True
-                    try:
-                        md_text = telegramify_markdown.markdownify(chunk)
-                        await client.send_message(
-                            text=md_text,
-                            parse_mode="MarkdownV2",
-                            **cast(Any, payload),
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            f"MarkdownV2 send failed: {e}. Using plain text instead.",
-                        )
-                        await client.send_message(text=chunk, **cast(Any, payload))
+            if remaining_text_chunks:
+                payload = get_base_payload()
+                payload["disable_web_page_preview"] = True
+                await cls._send_prepared_text_chunks(
+                    client,
+                    remaining_text_chunks,
+                    payload,
+                )
         elif videos:
             first_video = videos[0]
             path = await first_video.convert_to_file_path()
             payload = get_base_payload()
-            caption = getattr(first_video, "text", None) or full_text
-            if caption:
-                caption = caption[:1024] if len(caption) > 1024 else caption
-                try:
-                    caption = telegramify_markdown.markdownify(caption)
-                    payload["parse_mode"] = "MarkdownV2"
-                except Exception as e:
-                    logger.warning(f"Caption markdownify failed: {e}")
-            await client.send_video(
-                video=path,
-                caption=caption,
-                **cast(Any, payload),
+            caption_source = getattr(first_video, "text", None) or full_text or ""
+            caption_chunks = cls._prepare_text_chunks(
+                caption_source,
+                cls.MAX_CAPTION_LENGTH,
+            )
+            caption = caption_chunks[0][0] if caption_chunks else None
+            caption_fallback = caption_chunks[0][1] if caption_chunks else None
+            if caption_chunks and caption_chunks[0][1] is not None:
+                payload["parse_mode"] = "MarkdownV2"
+            video_payload = dict(payload)
+            video_payload.update(video=path, caption=caption)
+            await cls._send_media_with_caption_fallback(
+                client.send_video,
+                video_payload,
+                caption_fallback,
             )
 
+            remaining_text_chunks = caption_chunks[1:]
             for vid in videos[1:]:
                 path = await vid.convert_to_file_path()
                 payload = get_base_payload()
-                await client.send_video(
-                    video=path,
-                    caption=getattr(vid, "text", None),
-                    **cast(Any, payload),
+                video_caption_source = getattr(vid, "text", None) or ""
+                video_caption_chunks = cls._prepare_text_chunks(
+                    video_caption_source,
+                    cls.MAX_CAPTION_LENGTH,
                 )
+                video_caption = (
+                    video_caption_chunks[0][0] if video_caption_chunks else None
+                )
+                video_caption_fallback = (
+                    video_caption_chunks[0][1] if video_caption_chunks else None
+                )
+                if video_caption_chunks and video_caption_chunks[0][1] is not None:
+                    payload["parse_mode"] = "MarkdownV2"
+                video_payload = dict(payload)
+                video_payload.update(video=path, caption=video_caption)
+                await cls._send_media_with_caption_fallback(
+                    client.send_video,
+                    video_payload,
+                    video_caption_fallback,
+                )
+                remaining_text_chunks.extend(video_caption_chunks[1:])
 
-            if full_text and len(full_text) > 1024:
-                remaining_text = full_text[1024:]
-                chunks = cls._split_message(remaining_text)
-                for chunk in chunks:
-                    payload = get_base_payload()
-                    try:
-                        md_text = telegramify_markdown.markdownify(chunk)
-                        await client.send_message(
-                            text=md_text,
-                            parse_mode="MarkdownV2",
-                            **cast(Any, payload),
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            f"MarkdownV2 send failed: {e}. Using plain text instead.",
-                        )
-                        await client.send_message(text=chunk, **cast(Any, payload))
+            if remaining_text_chunks:
+                payload = get_base_payload()
+                payload["disable_web_page_preview"] = True
+                await cls._send_prepared_text_chunks(
+                    client,
+                    remaining_text_chunks,
+                    payload,
+                )
         elif full_text:
-            chunks = cls._split_message(full_text)
+            chunks = cls._prepare_text_chunks(full_text)
             for i, chunk in enumerate(chunks):
                 payload = get_base_payload()
                 payload["disable_web_page_preview"] = True
-                try:
-                    md_text = telegramify_markdown.markdownify(chunk)
-                    await client.send_message(
-                        text=md_text,
-                        parse_mode="MarkdownV2",
-                        reply_markup=reply_markup_keyboard if i == 0 else None,
-                        **cast(Any, payload),
-                    )
-                except Exception as e:
-                    logger.warning(
-                        f"MarkdownV2 send failed: {e}. Using plain text instead.",
-                    )
-                    await client.send_message(
-                        text=chunk,
-                        reply_markup=reply_markup_keyboard if i == 0 else None,
-                        **cast(Any, payload),
-                    )
+                payload["reply_markup"] = reply_markup_keyboard if i == 0 else None
+                await cls._send_prepared_text_chunks(client, [chunk], payload)
 
         for f in files:
             payload = get_base_payload()
@@ -687,6 +871,81 @@ class TelegramPlatformEvent(AstrMessageEvent):
         else:
             await self.send_with_client(self.client, message, self.get_sender_id())
         await super().send(message)
+
+    def supports_tool_call_status_update(self) -> bool:
+        """Return whether Telegram can edit a sent tool-call status message."""
+        return True
+
+    async def update_tool_call_status(self, message: MessageChain) -> bool:
+        """Send or edit the current tool-call status message.
+
+        Args:
+            message: The merged tool-call status message.
+
+        Returns:
+            Whether a new status message was sent.
+        """
+        text = message.get_plain_text(with_other_comps_mark=True)
+        if not text:
+            return False
+
+        prepared_chunks = self._prepare_text_chunks(text)
+        if not prepared_chunks:
+            return False
+        formatted_text, plain_text = prepared_chunks[0]
+
+        if self._tool_call_status_message_id is not None:
+            try:
+                edit_payload: dict[str, Any] = {
+                    "chat_id": self._tool_call_status_chat_id,
+                    "message_id": self._tool_call_status_message_id,
+                    "text": formatted_text,
+                }
+                if plain_text is not None:
+                    edit_payload["parse_mode"] = "MarkdownV2"
+                await self.client.edit_message_text(**cast(Any, edit_payload))
+                return False
+            except Exception as e:
+                logger.warning("Failed to edit tool-call status message: %s", e)
+                self.clear_tool_call_status()
+
+        if self.get_message_type() == MessageType.GROUP_MESSAGE:
+            chat_id = self.message_obj.group_id
+        else:
+            chat_id = self.get_sender_id()
+        message_thread_id = None
+        if "#" in chat_id:
+            chat_id, message_thread_id = chat_id.split("#", maxsplit=1)
+
+        payload: dict[str, Any] = {"chat_id": chat_id}
+        if message_thread_id:
+            payload["message_thread_id"] = message_thread_id
+        try:
+            send_payload = dict(payload)
+            if plain_text is not None:
+                send_payload["parse_mode"] = "MarkdownV2"
+            sent_message = await self.client.send_message(
+                text=formatted_text,
+                **cast(Any, send_payload),
+            )
+        except Exception as e:
+            logger.warning("Failed to send formatted tool-call status message: %s", e)
+            sent_message = await self.client.send_message(
+                text=plain_text or formatted_text,
+                **cast(Any, payload),
+            )
+
+        self._tool_call_status_chat_id = chat_id
+        self._tool_call_status_message_id = sent_message.message_id
+        self._tool_call_status_thread_id = message_thread_id
+        await super().send(message)
+        return True
+
+    def clear_tool_call_status(self) -> None:
+        """Clear the current editable tool-call status message reference."""
+        self._tool_call_status_chat_id = None
+        self._tool_call_status_message_id = None
+        self._tool_call_status_thread_id = None
 
     async def react(self, emoji: str | None, big: bool = False) -> None:
         """给原消息添加 Telegram 反应：
@@ -900,30 +1159,32 @@ class TelegramPlatformEvent(AstrMessageEvent):
                 text_changed.clear()
                 # 发送最新的缓冲区内容（MarkdownV2 渲染，与真实消息一致）
                 if delta and delta != last_sent_text:
-                    draft_text = delta[: self.MAX_MESSAGE_LENGTH]
-                    if draft_text != last_sent_text:
+                    prepared_chunks = self._prepare_text_chunks(
+                        delta,
+                        self.MAX_MESSAGE_LENGTH,
+                    )
+                    if prepared_chunks:
+                        draft_text, plain_text = prepared_chunks[0]
                         try:
-                            md = telegramify_markdown.markdownify(
-                                draft_text,
-                            )
                             await self._send_message_draft(
                                 user_name,
                                 draft_id,
-                                md,
+                                draft_text,
                                 message_thread_id,
-                                parse_mode="MarkdownV2",
+                                parse_mode=(
+                                    "MarkdownV2" if plain_text is not None else None
+                                ),
                             )
-                            last_sent_text = draft_text
+                            last_sent_text = delta
                         except Exception:
-                            # markdownify 对未闭合语法可能失败，回退纯文本
                             try:
                                 await self._send_message_draft(
                                     user_name,
                                     draft_id,
-                                    draft_text,
+                                    plain_text or draft_text,
                                     message_thread_id,
                                 )
-                                last_sent_text = draft_text
+                                last_sent_text = delta
                             except Exception as e2:
                                 logger.debug(
                                     f"[Telegram] sendMessageDraft failed (ignored): {e2!s}"
@@ -1022,8 +1283,56 @@ class TelegramPlatformEvent(AstrMessageEvent):
                 chain, payload, user_name, message_thread_id, _append_text
             )
 
+            delta_length = self._utf16_length(delta)
+            prepared_chunks: list[tuple[str, str | None]] | None = None
+            if delta_length > self.MAX_MESSAGE_LENGTH:
+                prepared_chunks = self._prepare_text_chunks(delta)
+                if len(prepared_chunks) > 1:
+                    chunks_to_send = prepared_chunks
+                    if message_id:
+                        first_formatted, first_plain = prepared_chunks[0]
+                        edit_payload: dict[str, Any] = {
+                            "text": first_formatted,
+                            "chat_id": payload["chat_id"],
+                            "message_id": message_id,
+                        }
+                        if first_plain is not None:
+                            edit_payload["parse_mode"] = "MarkdownV2"
+                        try:
+                            await self.client.edit_message_text(
+                                **cast(Any, edit_payload)
+                            )
+                        except (ValueError, BadRequest):
+                            if first_plain is not None:
+                                await self.client.edit_message_text(
+                                    text=first_plain,
+                                    chat_id=payload["chat_id"],
+                                    message_id=message_id,
+                                )
+                        except Exception as e:
+                            logger.warning(f"编辑消息失败(streaming-overflow): {e!s}")
+                        chunks_to_send = prepared_chunks[1:]
+                    if chunks_to_send:
+                        await self._send_prepared_text_chunks(
+                            self.client,
+                            chunks_to_send,
+                            payload,
+                        )
+                    message_id = None
+                    current_content = ""
+                    delta = ""
+                    last_edit_time = asyncio.get_running_loop().time()
+                    continue
+
+            if prepared_chunks:
+                display_text, display_plain_text = prepared_chunks[0]
+            else:
+                display_text, display_plain_text = delta, None
+
             # 编辑或发送消息
-            if message_id and len(delta) <= self.MAX_MESSAGE_LENGTH:
+            if message_id and (
+                delta_length <= self.MAX_MESSAGE_LENGTH or prepared_chunks
+            ):
                 current_time = asyncio.get_running_loop().time()
                 time_since_last_edit = current_time - last_edit_time
 
@@ -1033,12 +1342,26 @@ class TelegramPlatformEvent(AstrMessageEvent):
                         await self._ensure_typing(user_name, message_thread_id)
                         last_chat_action_time = current_time
                     try:
-                        await self.client.edit_message_text(
-                            text=delta,
-                            chat_id=payload["chat_id"],
-                            message_id=message_id,
-                        )
+                        edit_payload = {
+                            "text": display_text,
+                            "chat_id": payload["chat_id"],
+                            "message_id": message_id,
+                        }
+                        if display_plain_text is not None:
+                            edit_payload["parse_mode"] = "MarkdownV2"
+                        await self.client.edit_message_text(**cast(Any, edit_payload))
                         current_content = delta
+                    except (ValueError, BadRequest):
+                        if display_plain_text is not None:
+                            try:
+                                await self.client.edit_message_text(
+                                    text=display_plain_text,
+                                    chat_id=payload["chat_id"],
+                                    message_id=message_id,
+                                )
+                                current_content = delta
+                            except Exception as e:
+                                logger.warning(f"编辑消息失败(streaming): {e!s}")
                     except Exception as e:
                         logger.warning(f"编辑消息失败(streaming): {e!s}")
                     last_edit_time = asyncio.get_running_loop().time()
@@ -1048,34 +1371,53 @@ class TelegramPlatformEvent(AstrMessageEvent):
                     await self._ensure_typing(user_name, message_thread_id)
                     last_chat_action_time = current_time
                 try:
+                    send_payload = dict(payload)
+                    if display_plain_text is not None:
+                        send_payload["parse_mode"] = "MarkdownV2"
                     msg = await self.client.send_message(
-                        text=delta, **cast(Any, payload)
+                        text=display_text,
+                        **cast(Any, send_payload),
                     )
                     current_content = delta
                     message_id = msg.message_id
                     last_edit_time = asyncio.get_running_loop().time()
+                except (ValueError, BadRequest):
+                    try:
+                        msg = await self.client.send_message(
+                            text=display_plain_text or display_text,
+                            **cast(Any, payload),
+                        )
+                        current_content = delta
+                        message_id = msg.message_id
+                        last_edit_time = asyncio.get_running_loop().time()
+                    except Exception as e:
+                        logger.warning(f"发送消息失败(streaming): {e!s}")
                 except Exception as e:
                     logger.warning(f"发送消息失败(streaming): {e!s}")
 
         try:
             if delta and current_content != delta:
-                try:
-                    markdown_text = telegramify_markdown.markdownify(
-                        delta,
-                    )
-                    await self.client.edit_message_text(
-                        text=markdown_text,
-                        chat_id=payload["chat_id"],
-                        message_id=message_id,
-                        parse_mode="MarkdownV2",
-                    )
-                except Exception as e:
-                    logger.warning(f"Markdown转换失败，使用普通文本: {e!s}")
-                    await self.client.edit_message_text(
-                        text=delta,
-                        chat_id=payload["chat_id"],
-                        message_id=message_id,
-                    )
+                prepared_chunks = self._prepare_text_chunks(delta)
+                if prepared_chunks:
+                    final_text, final_plain_text = prepared_chunks[0]
+                    edit_payload = {
+                        "text": final_text,
+                        "chat_id": payload["chat_id"],
+                        "message_id": message_id,
+                    }
+                    if final_plain_text is not None:
+                        edit_payload["parse_mode"] = "MarkdownV2"
+                    try:
+                        await self.client.edit_message_text(**cast(Any, edit_payload))
+                    except (ValueError, BadRequest):
+                        if final_plain_text is not None:
+                            await self.client.edit_message_text(
+                                text=final_plain_text,
+                                chat_id=payload["chat_id"],
+                                message_id=message_id,
+                            )
+                    except Exception as e:
+                        logger.warning(f"编辑消息失败(streaming-final): {e!s}")
         except Exception as e:
             logger.warning(f"编辑消息失败(streaming): {e!s}")
 
@@ -2126,10 +2468,14 @@ class TelegramCallbackQueryEvent(AstrMessageEvent):
             reply_markup: 内联键盘（InlineKeyboardMarkup）
 
         """
+        safe_text = text
+        if parse_mode is None:
+            safe_text = TelegramPlatformEvent._split_message(text)[0]
+
         if self.inline_message_id:
             try:
                 await self.client.edit_message_text(
-                    text=text[: TelegramPlatformEvent.MAX_MESSAGE_LENGTH],
+                    text=safe_text,
                     inline_message_id=self.inline_message_id,
                     parse_mode=parse_mode,
                     reply_markup=reply_markup,
@@ -2141,7 +2487,7 @@ class TelegramCallbackQueryEvent(AstrMessageEvent):
                 chat_id = self.message.chat.id
                 message_id = self.message.message_id
                 await self.client.edit_message_text(
-                    text=text[: TelegramPlatformEvent.MAX_MESSAGE_LENGTH],
+                    text=safe_text,
                     chat_id=chat_id,
                     message_id=message_id,
                     parse_mode=parse_mode,
@@ -2177,11 +2523,14 @@ class TelegramCallbackQueryEvent(AstrMessageEvent):
                     f"Failed to convert reply_markup to InlineKeyboardMarkup: {e}"
                 )
 
+        prepared_chunks = TelegramPlatformEvent._prepare_text_chunks(text)
+        if not prepared_chunks:
+            return
+        formatted_text, plain_text = prepared_chunks[0]
         try:
-            markdown_text = telegramify_markdown.markdownify(text)
             await self._edit_message(
-                markdown_text,
-                parse_mode="MarkdownV2",
+                formatted_text,
+                parse_mode="MarkdownV2" if plain_text is not None else None,
                 reply_markup=reply_markup_keyboard,
             )
         except Exception as e:
@@ -2236,16 +2585,14 @@ class TelegramCallbackQueryEvent(AstrMessageEvent):
 
         try:
             if delta and current_content != delta:
-                try:
-                    markdown_text = telegramify_markdown.markdownify(delta)
+                prepared_chunks = TelegramPlatformEvent._prepare_text_chunks(delta)
+                if prepared_chunks:
+                    formatted_text, plain_text = prepared_chunks[0]
                     await self._edit_message(
-                        markdown_text,
-                        parse_mode="MarkdownV2",
+                        formatted_text,
+                        parse_mode="MarkdownV2" if plain_text is not None else None,
                         reply_markup=reply_markup_keyboard,
                     )
-                except Exception as e:
-                    logger.warning(f"Markdown转换失败，使用普通文本: {e!s}")
-                    await self._edit_message(delta, reply_markup=reply_markup_keyboard)
         except Exception as e:
             logger.warning(f"编辑消息失败(streaming): {e!s}")
 
