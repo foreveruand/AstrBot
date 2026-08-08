@@ -213,6 +213,7 @@ async def test_query_flattens_tools_and_enforces_stateless_body(monkeypatch):
     provider = _make_provider(
         {
             "custom_extra_body": {
+                "tools": [{"type": "web_search"}],
                 "max_tokens": 321,
                 "reasoning_effort": "low",
                 "previous_response_id": "resp_previous",
@@ -271,6 +272,7 @@ async def test_query_flattens_tools_and_enforces_stateless_body(monkeypatch):
     assert "previous_response_id" not in captured
     assert "conversation" not in captured
     assert captured["tools"] == [
+        {"type": "web_search"},
         {
             "type": "function",
             "name": "weather",
@@ -279,7 +281,7 @@ async def test_query_flattens_tools_and_enforces_stateless_body(monkeypatch):
                 "type": "object",
                 "properties": {"city": {"type": "string"}},
             },
-        }
+        },
     ]
     assert captured["extra_body"] == {
         "max_output_tokens": 321,
@@ -289,6 +291,89 @@ async def test_query_flattens_tools_and_enforces_stateless_body(monkeypatch):
     assert result.tools_call_name == ["weather"]
     assert result.tools_call_args == [{"city": "SZ"}]
     assert result.tools_call_ids == ["call_1"]
+
+
+@pytest.mark.asyncio
+async def test_query_sends_model_tools_without_runtime_tools(monkeypatch):
+    provider = _make_provider(
+        {"custom_extra_body": {"tools": [{"type": "web_search"}]}}
+    )
+    captured: dict = {}
+
+    async def fake_create(**kwargs):
+        captured.update(kwargs)
+        return _make_response(
+            [
+                {
+                    "type": "message",
+                    "id": "msg_1",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [
+                        {"type": "output_text", "text": "searched", "annotations": []}
+                    ],
+                }
+            ]
+        )
+
+    monkeypatch.setattr(provider.client.responses, "create", fake_create)
+
+    result = await provider._query(
+        {"model": "gpt-test", "input": "search", "store": False},
+        tools=None,
+    )
+
+    assert captured["tools"] == [{"type": "web_search"}]
+    assert "tools" not in captured["extra_body"]
+    assert result.completion_text == "searched"
+
+
+@pytest.mark.asyncio
+async def test_query_sends_runtime_tools_without_model_tools(monkeypatch):
+    provider = _make_provider()
+    captured: dict = {}
+
+    async def fake_create(**kwargs):
+        captured.update(kwargs)
+        return _make_response(
+            [
+                {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": "weather",
+                    "arguments": '{"city":"SZ"}',
+                    "status": "completed",
+                }
+            ]
+        )
+
+    monkeypatch.setattr(provider.client.responses, "create", fake_create)
+    tools = SimpleNamespace(
+        openai_schema=lambda: [
+            {
+                "type": "function",
+                "function": {
+                    "name": "weather",
+                    "parameters": {"type": "object"},
+                },
+            }
+        ]
+    )
+
+    result = await provider._query(
+        {"model": "gpt-test", "input": "weather", "store": False},
+        tools,
+    )
+
+    assert captured["tools"] == [
+        {
+            "type": "function",
+            "name": "weather",
+            "parameters": {"type": "object"},
+        }
+    ]
+    assert result.tools_call_name == ["weather"]
 
 
 @pytest.mark.asyncio
@@ -331,6 +416,41 @@ async def test_parse_response_extracts_text_reasoning_usage_and_replay_state():
     assert state["items"][0]["content"] == [
         {"text": "thinking", "type": "reasoning_text"}
     ]
+
+
+@pytest.mark.asyncio
+async def test_parse_response_keeps_native_tool_output_as_assistant_response():
+    provider = _make_provider()
+    response = _make_response(
+        [
+            {
+                "type": "web_search_call",
+                "id": "ws_1",
+                "status": "completed",
+                "action": {
+                    "type": "search",
+                    "query": "AstrBot",
+                    "queries": ["AstrBot"],
+                },
+            },
+            {
+                "type": "message",
+                "id": "msg_1",
+                "status": "completed",
+                "role": "assistant",
+                "content": [
+                    {"type": "output_text", "text": "native result", "annotations": []}
+                ],
+            },
+        ]
+    )
+
+    result = await provider._parse_response(response, tools=None)
+
+    assert result.role == "assistant"
+    assert result.completion_text == "native result"
+    assert result.tools_call_name == []
+    assert result.raw_completion is response
 
 
 @pytest.mark.asyncio
