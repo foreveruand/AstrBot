@@ -314,19 +314,28 @@ class ProviderOpenAIResponses(ProviderOpenAIOfficial):
         Raises:
             TypeError: If the SDK returns an unexpected response type.
         """
+        response_tools: list[dict] = []
         if tools:
-            response_tools = []
             for tool in tools.openai_schema():
                 function = tool.get("function", {})
                 response_tools.append({"type": "function", **function})
-            if response_tools:
-                payloads["tools"] = response_tools
-                payloads["tool_choice"] = payloads.get("tool_choice", "auto")
 
         extra_body: dict[str, Any] = {}
         custom_extra_body = self.provider_config.get("custom_extra_body", {})
         if isinstance(custom_extra_body, dict):
             extra_body.update(custom_extra_body)
+
+        model_tools = extra_body.pop("tools", [])
+        if not isinstance(model_tools, list):
+            if model_tools is not None:
+                logger.warning(
+                    "Responses model custom_extra_body.tools must be a list; ignoring it."
+                )
+            model_tools = []
+        if model_tools or response_tools:
+            payloads["tools"] = [*model_tools, *response_tools]
+            if response_tools:
+                payloads["tool_choice"] = payloads.get("tool_choice", "auto")
 
         for key in list(payloads):
             if key not in self.default_params:
@@ -383,19 +392,28 @@ class ProviderOpenAIResponses(ProviderOpenAIOfficial):
         Raises:
             EmptyModelOutputError: If the stream ends without a terminal event.
         """
+        response_tools: list[dict] = []
         if tools:
-            response_tools = []
             for tool in tools.openai_schema():
                 function = tool.get("function", {})
                 response_tools.append({"type": "function", **function})
-            if response_tools:
-                payloads["tools"] = response_tools
-                payloads["tool_choice"] = payloads.get("tool_choice", "auto")
 
         extra_body: dict[str, Any] = {}
         custom_extra_body = self.provider_config.get("custom_extra_body", {})
         if isinstance(custom_extra_body, dict):
             extra_body.update(custom_extra_body)
+
+        model_tools = extra_body.pop("tools", [])
+        if not isinstance(model_tools, list):
+            if model_tools is not None:
+                logger.warning(
+                    "Responses model custom_extra_body.tools must be a list; ignoring it."
+                )
+            model_tools = []
+        if model_tools or response_tools:
+            payloads["tools"] = [*model_tools, *response_tools]
+            if response_tools:
+                payloads["tool_choice"] = payloads.get("tool_choice", "auto")
 
         for key in list(payloads):
             if key not in self.default_params:
