@@ -791,7 +791,8 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
         if not self.req:
             raise ValueError("Request is not set. Please call reset() first.")
 
-        if self._state == AgentState.IDLE:
+        is_first_step = self._state == AgentState.IDLE
+        if is_first_step:
             try:
                 await self.agent_hooks.on_agent_begin(self.run_context)
             except Exception as e:
@@ -801,20 +802,24 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
         self._transition_state(AgentState.RUNNING)
         llm_resp_result = None
 
-        # Process request-time context before sending it to the provider.
-        token_usage = self.req.conversation.token_usage if self.req.conversation else 0
-        self._simple_print_message_role("[BefCompact]", self.run_context.messages)
-        processed_messages = await self._await_or_stop(
-            self.request_context_manager.process(
-                self.run_context.messages,
-                trusted_token_usage=token_usage,
+        if is_first_step:
+            # Context processing only runs before the initial LLM request. Tool-loop
+            # messages remain append-only so an active task cannot be truncated.
+            token_usage = (
+                self.req.conversation.token_usage if self.req.conversation else 0
             )
-        )
-        if processed_messages is None:
-            yield await self._finalize_aborted_step()
-            return
-        self.run_context.messages = processed_messages
-        self._simple_print_message_role("[AftCompact]", self.run_context.messages)
+            self._simple_print_message_role("[BefCompact]", self.run_context.messages)
+            processed_messages = await self._await_or_stop(
+                self.request_context_manager.process(
+                    self.run_context.messages,
+                    trusted_token_usage=token_usage,
+                )
+            )
+            if processed_messages is None:
+                yield await self._finalize_aborted_step()
+                return
+            self.run_context.messages = processed_messages
+            self._simple_print_message_role("[AftCompact]", self.run_context.messages)
 
         async for llm_response in self._iter_llm_responses_with_fallback():
             if llm_response.is_chunk:

@@ -109,9 +109,26 @@ class TestContextManager:
             result = await compressor(messages)
 
         assert result == messages
+        assert compressor.last_call_failed is True
         mock_logger.warning.assert_called_once_with(
             "LLM context compression returned an empty summary."
         )
+
+    @pytest.mark.asyncio
+    async def test_llm_compressor_marks_error_response_as_failed(self):
+        from astrbot.core.agent.context.compressor import LLMSummaryCompressor
+
+        provider = MockProvider()
+        provider.text_chat = AsyncMock(
+            return_value=LLMResponse(role="err", completion_text="provider error")
+        )
+        compressor = LLMSummaryCompressor(provider=provider)  # type: ignore[arg-type]
+        messages = self.create_messages(4)
+
+        result = await compressor(messages)
+
+        assert result == messages
+        assert compressor.last_call_failed is True
 
     @pytest.mark.asyncio
     async def test_llm_compressor_handles_textpart_content(self):
@@ -142,9 +159,7 @@ class TestContextManager:
         }
         assert summary_contexts[-1]["role"] == "user"
         assert compressor.instruction_text in summary_contexts[-1]["content"]
-        assert (
-            compressor.TASK_CONTINUATION_INSTRUCTION in summary_contexts[-1]["content"]
-        )
+        assert "concrete next step" in summary_contexts[-1]["content"]
 
         assert len(result) == 4
         assert result[0].role == "user"
@@ -179,9 +194,7 @@ class TestContextManager:
         assert summary_contexts[2]["content"]
         assert summary_contexts[3]["role"] == "user"
         assert instruction in summary_contexts[3]["content"]
-        assert (
-            compressor.TASK_CONTINUATION_INSTRUCTION in summary_contexts[3]["content"]
-        )
+        assert "concrete next step" not in summary_contexts[3]["content"]
 
         assert result[0] is messages[0]
         assert result[-1] is messages[-1]
@@ -223,9 +236,7 @@ class TestContextManager:
         assert summary_contexts[3]["role"] == "assistant"
         assert summary_contexts[4]["role"] == "user"
         assert "Summarize the whole trajectory." in summary_contexts[4]["content"]
-        assert (
-            compressor.TASK_CONTINUATION_INSTRUCTION in summary_contexts[4]["content"]
-        )
+        assert "concrete next step" not in summary_contexts[4]["content"]
         assert all(original not in result for original in messages)
         assert len(result) == 2
 
@@ -598,13 +609,42 @@ class TestContextManager:
             with patch.object(manager.compressor, "__call__", new=mock_compress):
                 with patch.object(
                     manager.truncator,
-                    "truncate_by_halving",
-                    return_value=long_messages[:5],
-                ) as mock_halving:
-                    _ = await manager.process(long_messages)
+                    "truncate_by_dropping_oldest_turns",
+                    return_value=long_messages,
+                ) as mock_drop:
+                    with patch.object(
+                        manager.truncator,
+                        "truncate_by_halving",
+                        return_value=long_messages[:5],
+                    ) as mock_halving:
+                        _ = await manager.process(long_messages)
 
-                    # Halving should be called
-                    mock_halving.assert_called_once()
+                        # Round truncation is attempted before halving.
+                        mock_drop.assert_called()
+                        assert mock_halving.call_count <= 1
+
+    @pytest.mark.asyncio
+    async def test_llm_error_response_falls_back_to_round_truncation(self):
+        provider = MockProvider()
+        provider.text_chat = AsyncMock(
+            return_value=LLMResponse(role="err", completion_text="summary error")
+        )
+        config = ContextConfig(
+            enforce_max_turns=1,
+            truncate_turns=1,
+            llm_compress_provider=provider,  # type: ignore[arg-type]
+        )
+        manager = ContextManager(config)
+        messages = [
+            Message(role="user", content="old request"),
+            Message(role="assistant", content="old response"),
+            Message(role="user", content="current request"),
+        ]
+
+        result = await manager.process(messages)
+
+        assert provider.text_chat.await_count == 1
+        assert [message.content for message in result] == ["current request"]
 
     # ==================== Combined Truncation and Compression Tests ====================
 
@@ -1035,6 +1075,28 @@ class TestContextManager:
         # One round with 5 segments
         assert len(rounds) == 1
         assert len(rounds[0]) == 5
+
+    def test_count_conversation_rounds_groups_tool_chain(self):
+        from astrbot.core.agent.context.round_utils import count_conversation_rounds
+
+        messages = [
+            Message(role="user", content="search"),
+            Message(
+                role="assistant",
+                content=None,
+                tool_calls=[
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {"name": "search", "arguments": "{}"},
+                    }
+                ],
+            ),
+            Message(role="tool", content="result", tool_call_id="c1"),
+            Message(role="assistant", content="done"),
+        ]
+
+        assert count_conversation_rounds(messages) == 1
 
     def test_split_rounds_empty(self):
         """Empty list returns no rounds."""

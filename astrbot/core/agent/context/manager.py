@@ -3,6 +3,7 @@ from astrbot import logger
 from ..message import Message
 from .compressor import LLMSummaryCompressor, TruncateByTurnsCompressor
 from .config import ContextConfig
+from .round_utils import count_conversation_rounds
 from .token_counter import EstimateTokenCounter
 from .truncator import ContextTruncator
 
@@ -55,16 +56,35 @@ class ContextManager:
         """
         try:
             result = messages
+            summarized_for_turn_limit = False
 
-            # 1. 基于轮次的截断 (Enforce max turns)
+            # Apply the configured summary strategy before dropping complete rounds.
             if self.config.enforce_max_turns != -1:
-                result = self.truncator.truncate_by_turns(
-                    result,
-                    keep_most_recent_turns=self.config.enforce_max_turns,
-                    drop_turns=self.config.truncate_turns,
-                )
+                turn_count = count_conversation_rounds(result)
+                if turn_count > self.config.enforce_max_turns:
+                    if isinstance(self.compressor, LLMSummaryCompressor):
+                        logger.debug(
+                            "Turn limit (%s) exceeded (%s turns), summarizing earlier rounds.",
+                            self.config.enforce_max_turns,
+                            turn_count,
+                        )
+                        result = await self.compressor(result)
+                        if self.compressor.last_call_failed:
+                            result = self.truncator.truncate_by_turns(
+                                result,
+                                keep_most_recent_turns=self.config.enforce_max_turns,
+                                drop_turns=self.config.truncate_turns,
+                            )
+                        else:
+                            summarized_for_turn_limit = True
+                    else:
+                        result = self.truncator.truncate_by_turns(
+                            result,
+                            keep_most_recent_turns=self.config.enforce_max_turns,
+                            drop_turns=self.config.truncate_turns,
+                        )
 
-            # 2. 基于 token 的压缩
+            # Token-based guarding applies before an agent starts its tool loop.
             if self.config.max_context_tokens > 0:
                 total_tokens = self.token_counter.count_tokens(
                     result, trusted_token_usage
@@ -73,7 +93,12 @@ class ContextManager:
                 if self.compressor.should_compress(
                     result, total_tokens, self.config.max_context_tokens
                 ):
-                    result = await self._run_compression(result, total_tokens)
+                    if summarized_for_turn_limit:
+                        result = self._truncate_until_within_token_limit(
+                            result, total_tokens
+                        )
+                    else:
+                        result = await self._run_compression(result, total_tokens)
 
             return result
         except Exception as e:
@@ -96,6 +121,12 @@ class ContextManager:
         logger.debug("Compress triggered, starting compression...")
 
         messages = await self.compressor(messages)
+        if (
+            isinstance(self.compressor, LLMSummaryCompressor)
+            and self.compressor.last_call_failed
+        ):
+            logger.info("LLM compression failed, applying turn-based truncation.")
+            return self._truncate_until_within_token_limit(messages, prev_tokens)
 
         # double check
         tokens_after_summary = self.token_counter.count_tokens(messages)
@@ -113,9 +144,43 @@ class ContextManager:
             messages, tokens_after_summary, self.config.max_context_tokens
         ):
             logger.info(
-                "Context still exceeds max tokens after compression, applying halving truncation..."
+                "Context still exceeds max tokens after compression, truncating oldest rounds..."
             )
-            # still need compress, truncate by half
-            messages = self.truncator.truncate_by_halving(messages)
+            messages = self._truncate_until_within_token_limit(
+                messages, tokens_after_summary
+            )
+
+        return messages
+
+    def _truncate_until_within_token_limit(
+        self, messages: list[Message], current_tokens: int
+    ) -> list[Message]:
+        """Drop oldest complete rounds until the context reaches the token target.
+
+        Args:
+            messages: Context messages to truncate.
+            current_tokens: Estimated token count for messages.
+
+        Returns:
+            The safely truncated message list.
+        """
+        while self.compressor.should_compress(
+            messages, current_tokens, self.config.max_context_tokens
+        ):
+            truncated = self.truncator.truncate_by_dropping_oldest_turns(
+                messages, drop_turns=self.config.truncate_turns
+            )
+            if truncated == messages:
+                if count_conversation_rounds(messages) <= 1:
+                    break
+                truncated = self.truncator.truncate_by_halving(messages)
+            if truncated == messages:
+                break
+
+            next_tokens = self.token_counter.count_tokens(truncated)
+            if next_tokens >= current_tokens:
+                break
+            messages = truncated
+            current_tokens = next_tokens
 
         return messages

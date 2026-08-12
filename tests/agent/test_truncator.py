@@ -146,6 +146,31 @@ class TestContextTruncator:
         # First non-system message should be user
         assert result[0].role == "user"
 
+    def test_truncate_by_turns_keeps_tool_chain_as_one_round(self):
+        truncator = ContextTruncator()
+        messages = [
+            self.create_message("user", "Run a tool"),
+            Message(
+                role="assistant",
+                content=None,
+                tool_calls=[
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"},
+                    }
+                ],
+            ),
+            Message(role="tool", content="Tool result", tool_call_id="call_1"),
+            self.create_message("assistant", "Done"),
+        ]
+
+        result = truncator.truncate_by_turns(
+            messages, keep_most_recent_turns=1, drop_turns=1
+        )
+
+        assert result == messages
+
     def test_truncate_by_turns_multiple_drop(self):
         """Test truncate_by_turns with multiple turns dropped at once."""
         truncator = ContextTruncator()

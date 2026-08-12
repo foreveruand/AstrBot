@@ -615,6 +615,32 @@ async def test_tool_loop_next_request_includes_tool_result(
 
 
 @pytest.mark.asyncio
+async def test_tool_loop_context_is_processed_only_before_first_step(
+    runner, provider_request, mock_tool_executor, mock_hooks
+):
+    provider = SequentialToolProvider(["test_tool", "test_tool"])
+
+    await runner.reset(
+        provider=provider,
+        request=provider_request,
+        run_context=ContextWrapper(context=None),
+        tool_executor=mock_tool_executor,
+        agent_hooks=mock_hooks,
+        streaming=False,
+    )
+    process = AsyncMock(wraps=runner.request_context_manager.process)
+    runner.request_context_manager.process = process
+
+    async for _ in runner.step_until_done(4):
+        pass
+
+    assert process.await_count == 1
+    assert provider.call_count == 3
+    assert sum(message.role == "tool" for message in runner.run_context.messages) == 2
+    assert runner.run_context.messages[-1].content[0].text == "这是我的最终回答"
+
+
+@pytest.mark.asyncio
 async def test_normal_completion_without_max_step(
     runner, mock_provider, provider_request, mock_tool_executor, mock_hooks
 ):

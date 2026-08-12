@@ -118,11 +118,6 @@ class LLMSummaryCompressor:
     budget as exact context.
     """
 
-    TASK_CONTINUATION_INSTRUCTION = (
-        "If a task appears to be in progress, end the summary with the latest "
-        "known result and the concrete next step to continue the task."
-    )
-
     def __init__(
         self,
         provider: "Provider",
@@ -144,15 +139,20 @@ class LLMSummaryCompressor:
         self.keep_recent_ratio = min(max(float(keep_recent_ratio), 0.0), 0.3)
         self.compression_threshold = compression_threshold
         self.token_counter = token_counter or EstimateTokenCounter()
+        self.last_call_failed = False
 
-        self.instruction_text = instruction_text or (
-            "Based on our full conversation history, produce a concise summary of key takeaways and/or project progress.\n"
-            "The primary goal of this summary is to enable seamless continuation of the work that follows.\n"
-            "1. Systematically cover all core topics discussed and the final conclusion/outcome for each; clearly highlight the latest primary focus.\n"
-            "2. If any tools were used, summarize tool usage (total call count) and extract the most valuable insights from tool outputs.\n"
-            "3. If any materials (files, documents, code, references) were read during the conversation that may be helpful for subsequent work, list each one with its scope and path.\n"
-            "4. If there was an initial user goal, state it first and describe the current progress/status.\n"
-            "5. Write the summary in the user's language.\n"
+        self.instruction_text = (
+            instruction_text
+            if instruction_text is not None
+            else (
+                "Based on our full conversation history, produce a concise summary of key takeaways and/or project progress.\n"
+                "The primary goal of this summary is to enable seamless continuation of the work that follows.\n"
+                "1. State the original user goal, requirements, and constraints first, then describe the current task status.\n"
+                "2. Cover completed work, key findings, decisions, conclusions, limitations, and unresolved issues.\n"
+                "3. If tools were used, summarize the useful tool outputs and list relevant files, paths, documents, code, or references.\n"
+                "4. End with remaining work and one concrete next step.\n"
+                "5. Write the summary in the user's language.\n"
+            )
         )
 
     def should_compress(
@@ -212,6 +212,8 @@ class LLMSummaryCompressor:
         """
         from .round_utils import split_into_rounds
 
+        self.last_call_failed = False
+
         rounds = split_into_rounds(messages)
         message_rounds = [
             [seg for seg in rnd if isinstance(seg, Message)] for rnd in rounds
@@ -259,8 +261,7 @@ class LLMSummaryCompressor:
                 role="user",
                 content=(
                     "Generate a summary of our previous conversation history.\n"
-                    f"<extra_instruction>\n{self.instruction_text}\n\n"
-                    f"{self.TASK_CONTINUATION_INSTRUCTION}</extra_instruction>\n"
+                    f"<extra_instruction>\n{self.instruction_text}</extra_instruction>\n"
                     "Respond ONLY with the summary content, without any additional text or formatting."
                 ),
             )
@@ -276,13 +277,19 @@ class LLMSummaryCompressor:
             response = await self.provider.text_chat(
                 contexts=sanitized_summary_contexts,
             )
+            if response.role == "err":
+                logger.error(f"Failed to generate summary: {response.completion_text}")
+                self.last_call_failed = True
+                return messages
             summary_content = (response.completion_text or "").strip()
         except Exception as e:
             logger.error(f"Failed to generate summary: {e}")
+            self.last_call_failed = True
             return messages
 
         if not summary_content:
             logger.warning("LLM context compression returned an empty summary.")
+            self.last_call_failed = True
             return messages
 
         # Build result: system messages + summary pair + recent rounds
