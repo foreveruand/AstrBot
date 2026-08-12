@@ -35,6 +35,22 @@ def split_into_rounds(
     return rounds
 
 
+def count_conversation_rounds(contexts: Sequence[RoundSegment]) -> int:
+    """Count logical conversation rounds started by user messages.
+
+    Args:
+        contexts: Flat message contexts.
+
+    Returns:
+        Number of rounds that contain a user message.
+    """
+    return sum(
+        1
+        for round_segments in split_into_rounds(contexts)
+        if any(_segment_role(segment) == "user" for segment in round_segments)
+    )
+
+
 def _content_to_text(content: Any) -> str:
     if isinstance(content, list):
         normalized = [

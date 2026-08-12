@@ -1,4 +1,5 @@
 from ..message import Message
+from .round_utils import count_conversation_rounds, split_into_rounds
 
 
 class ContextTruncator:
@@ -105,7 +106,8 @@ class ContextTruncator:
     ) -> list[Message]:
         """
         Turn-based truncation strategy, which drops the oldest turns while keeping the most recent N turns.
-        A turn consists of a user message and an assistant message.
+        A turn begins with a user message and includes all following assistant
+        and tool messages until the next user message.
         This method ensures that the truncated context list conforms to OpenAI's context format.
 
         Args:
@@ -120,15 +122,20 @@ class ContextTruncator:
             return messages
 
         system_messages, non_system_messages = self._split_system_rest(messages)
+        rounds = split_into_rounds(non_system_messages)
 
-        if len(non_system_messages) // 2 <= keep_most_recent_turns:
+        if count_conversation_rounds(non_system_messages) <= keep_most_recent_turns:
             return messages
 
         num_to_keep = keep_most_recent_turns - drop_turns + 1
         if num_to_keep <= 0:
-            truncated_contexts = []
+            truncated_contexts = list(rounds[-1]) if rounds else []
         else:
-            truncated_contexts = non_system_messages[-num_to_keep * 2 :]
+            truncated_contexts = [
+                segment
+                for round_segments in rounds[-num_to_keep:]
+                for segment in round_segments
+            ]
 
         # Find the first user message
         index = next(
@@ -153,11 +160,16 @@ class ContextTruncator:
             return messages
 
         system_messages, non_system_messages = self._split_system_rest(messages)
+        rounds = split_into_rounds(non_system_messages)
 
-        if len(non_system_messages) // 2 <= drop_turns:
-            truncated_non_system = []
+        if count_conversation_rounds(non_system_messages) <= drop_turns:
+            truncated_non_system = list(rounds[-1]) if rounds else []
         else:
-            truncated_non_system = non_system_messages[drop_turns * 2 :]
+            truncated_non_system = [
+                segment
+                for round_segments in rounds[drop_turns:]
+                for segment in round_segments
+            ]
 
         # Find the first user message
         index = next(
