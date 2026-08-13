@@ -1406,6 +1406,10 @@
                 "description": "Режим параметра dimensions",
                 "hint": "Управляет отправкой параметра dimensions в OpenAI-совместимых запросах Embedding. auto отправляет его только для официальных моделей OpenAI embedding-3; используйте always, если совместимый API поддерживает параметр, или never, если он отклоняет параметр."
             },
+            "embedding_encoding_format": {
+                "description": "Формат кодирования выходного embedding",
+                "hint": "Управляет форматом кодирования векторов в OpenAI-совместимых ответах embedding. Используйте float для Google AI Studio и OpenRouter Gemini Embedding."
+            },
             "embedding_model": {
                 "description": "Модель эмбеддингов",
                 "hint": "Имя модели эмбеддингов."

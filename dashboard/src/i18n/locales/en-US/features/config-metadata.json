@@ -1409,6 +1409,10 @@
         "description": "Embedding dimensions mode",
         "hint": "Controls whether to send the dimensions parameter in OpenAI-compatible embedding requests. auto sends it only for official OpenAI embedding-3 models; use always when a compatible API supports it, or never when it rejects the parameter."
       },
+      "embedding_encoding_format": {
+        "description": "Embedding output encoding format",
+        "hint": "Controls the vector encoding format in OpenAI-compatible embedding responses. Use float for Google AI Studio and OpenRouter Gemini Embedding."
+      },
       "embedding_model": {
         "description": "Embedding model",
         "hint": "Embedding model name."

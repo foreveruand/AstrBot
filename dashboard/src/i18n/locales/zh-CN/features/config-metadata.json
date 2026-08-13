@@ -1411,6 +1411,10 @@
         "description": "嵌入维度参数发送模式",
         "hint": "控制是否在 OpenAI 兼容 Embedding 请求中发送 dimensions 参数。auto 会仅对官方 OpenAI embedding-3 模型自动发送；第三方兼容 API 如需该参数可改为 always，报错时改为 never。"
       },
+      "embedding_encoding_format": {
+        "description": "嵌入输出编码格式",
+        "hint": "控制 OpenAI 兼容 Embedding 响应中的向量编码格式。Google AI Studio 和 OpenRouter 的 Gemini Embedding 请使用 float。"
+      },
       "embedding_model": {
         "description": "嵌入模型",
         "hint": "嵌入模型名称。"

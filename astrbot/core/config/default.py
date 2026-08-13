@@ -1878,6 +1878,7 @@ CONFIG_METADATA_2 = {
                         "embedding_model": "",
                         "embedding_dimensions": 1024,
                         "embedding_dimensions_mode": "auto",
+                        "embedding_encoding_format": "float",
                         "timeout": 20,
                         "proxy": "",
                     },
@@ -2314,6 +2315,12 @@ CONFIG_METADATA_2 = {
                         "type": "string",
                         "options": ["auto", "always", "never"],
                         "hint": "控制是否在 OpenAI 兼容 Embedding 请求中发送 dimensions 参数。auto 会仅对官方 OpenAI embedding-3 模型自动发送；第三方兼容 API 如需该参数可改为 always，报错时改为 never。",
+                    },
+                    "embedding_encoding_format": {
+                        "description": "嵌入输出编码格式",
+                        "type": "string",
+                        "options": ["float", "base64"],
+                        "hint": "控制 OpenAI 兼容 Embedding 响应中的向量编码格式。Google AI Studio 和 OpenRouter 的 Gemini Embedding 请使用 float。",
                     },
                     "embedding_model": {
                         "description": "嵌入模型",

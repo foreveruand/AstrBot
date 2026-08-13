@@ -641,7 +641,9 @@ async def test_result_decorate_skips_quote_and_mention_for_chosen_inline():
         "t2i": False,
     }
     ctx.plugin_manager = MagicMock()
-    ctx.plugin_manager.context.get_using_tts_provider.return_value = None
+    ctx.plugin_manager.context.get_using_tts_provider_async = AsyncMock(
+        return_value=None,
+    )
     await stage.initialize(ctx)
 
     async for _ in stage.process(event):

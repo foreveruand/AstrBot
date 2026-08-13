@@ -1,4 +1,6 @@
+import base64
 import re
+from array import array
 from urllib.parse import urlparse
 
 import httpx
@@ -54,7 +56,7 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
             model=self.model,
             **kwargs,
         )
-        return embedding.data[0].embedding
+        return self._embedding_values(embedding.data[0].embedding)
 
     async def get_embeddings(self, text: list[str]) -> list[list[float]]:
         """批量获取文本的嵌入"""
@@ -64,11 +66,39 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
             model=self.model,
             **kwargs,
         )
-        return [item.embedding for item in embeddings.data]
+        return [self._embedding_values(item.embedding) for item in embeddings.data]
+
+    @staticmethod
+    def _embedding_values(embedding: list[float] | str) -> list[float]:
+        """Convert an embedding response into float values.
+
+        Args:
+            embedding: A float vector or a base64-encoded float vector.
+
+        Returns:
+            The decoded float vector.
+        """
+        if isinstance(embedding, list):
+            return embedding
+        values = array("f")
+        values.frombytes(base64.b64decode(embedding))
+        return values.tolist()
 
     def _embedding_kwargs(self) -> dict:
-        """Build optional embedding request parameters."""
+        """Build optional embedding request parameters.
+
+        Returns:
+            Optional parameters accepted by the OpenAI embeddings API.
+        """
         kwargs = {}
+        encoding_format = self.provider_config.get("embedding_encoding_format", "float")
+        if encoding_format not in {"float", "base64"}:
+            logger.warning(
+                "Unknown embedding_encoding_format in embedding configs: "
+                f"'{encoding_format}', fallback to 'float'."
+            )
+            encoding_format = "float"
+        kwargs["encoding_format"] = encoding_format
         dimensions_mode = self.provider_config.get("embedding_dimensions_mode", "auto")
         if dimensions_mode not in {"auto", "always", "never"}:
             logger.warning(

@@ -1,3 +1,6 @@
+import base64
+from array import array
+
 from astrbot.core.provider.sources.openai_embedding_source import (
     OpenAIEmbeddingProvider,
     _normalize_api_base,
@@ -27,7 +30,10 @@ def test_openai_embedding_dimensions_auto_sends_for_official_openai_embedding_3(
     provider.model = "text-embedding-3-small"
 
     assert provider.get_dim() == 1024
-    assert provider._embedding_kwargs() == {"dimensions": 1024}
+    assert provider._embedding_kwargs() == {
+        "dimensions": 1024,
+        "encoding_format": "float",
+    }
 
 
 def test_openai_embedding_dimensions_invalid_mode_falls_back_to_auto():
@@ -39,7 +45,10 @@ def test_openai_embedding_dimensions_invalid_mode_falls_back_to_auto():
     provider.model = "text-embedding-3-small"
 
     assert provider.get_dim() == 1024
-    assert provider._embedding_kwargs() == {"dimensions": 1024}
+    assert provider._embedding_kwargs() == {
+        "dimensions": 1024,
+        "encoding_format": "float",
+    }
 
 
 def test_openai_embedding_dimensions_auto_skips_for_official_openai_non_3_model():
@@ -51,7 +60,7 @@ def test_openai_embedding_dimensions_auto_skips_for_official_openai_non_3_model(
     }
     provider.model = "text-embedding-ada-002"
 
-    assert provider._embedding_kwargs() == {}
+    assert provider._embedding_kwargs() == {"encoding_format": "float"}
 
 
 def test_openai_embedding_dimensions_auto_skips_custom_api_base():
@@ -63,7 +72,7 @@ def test_openai_embedding_dimensions_auto_skips_custom_api_base():
     }
     provider.model = "BAAI/bge-m3"
 
-    assert provider._embedding_kwargs() == {}
+    assert provider._embedding_kwargs() == {"encoding_format": "float"}
 
 
 def test_openai_embedding_dimensions_auto_sends_for_siliconflow_qwen():
@@ -75,7 +84,10 @@ def test_openai_embedding_dimensions_auto_sends_for_siliconflow_qwen():
     }
     provider.model = "Qwen/Qwen3-Embedding-4B"
 
-    assert provider._embedding_kwargs() == {"dimensions": 1024}
+    assert provider._embedding_kwargs() == {
+        "dimensions": 1024,
+        "encoding_format": "float",
+    }
 
 
 def test_openai_embedding_dimensions_auto_skips_siliconflow_lookalike_host():
@@ -87,7 +99,7 @@ def test_openai_embedding_dimensions_auto_skips_siliconflow_lookalike_host():
     }
     provider.model = "Qwen/Qwen3-Embedding-4B"
 
-    assert provider._embedding_kwargs() == {}
+    assert provider._embedding_kwargs() == {"encoding_format": "float"}
 
 
 def test_openai_embedding_dimensions_auto_handles_empty_model():
@@ -95,7 +107,10 @@ def test_openai_embedding_dimensions_auto_handles_empty_model():
     provider.provider_config = {"embedding_dimensions": 1024}
     provider.model = None
 
-    assert provider._embedding_kwargs() == {"dimensions": 1024}
+    assert provider._embedding_kwargs() == {
+        "dimensions": 1024,
+        "encoding_format": "float",
+    }
 
 
 def test_openai_embedding_dimensions_are_sent_when_mode_is_always():
@@ -106,14 +121,17 @@ def test_openai_embedding_dimensions_are_sent_when_mode_is_always():
     }
 
     assert provider.get_dim() == 1024
-    assert provider._embedding_kwargs() == {"dimensions": 1024}
+    assert provider._embedding_kwargs() == {
+        "dimensions": 1024,
+        "encoding_format": "float",
+    }
 
 
 def test_openai_embedding_dimensions_always_mode_without_dimensions_sends_nothing():
     provider = OpenAIEmbeddingProvider.__new__(OpenAIEmbeddingProvider)
     provider.provider_config = {"embedding_dimensions_mode": "always"}
 
-    assert provider._embedding_kwargs() == {}
+    assert provider._embedding_kwargs() == {"encoding_format": "float"}
 
 
 def test_openai_embedding_dimensions_invalid_value_is_ignored():
@@ -124,7 +142,7 @@ def test_openai_embedding_dimensions_invalid_value_is_ignored():
     }
 
     assert provider.get_dim() == 0
-    assert provider._embedding_kwargs() == {}
+    assert provider._embedding_kwargs() == {"encoding_format": "float"}
 
 
 def test_openai_embedding_dimensions_are_local_when_mode_is_never():
@@ -136,4 +154,24 @@ def test_openai_embedding_dimensions_are_local_when_mode_is_never():
     provider.model = "text-embedding-3-small"
 
     assert provider.get_dim() == 1024
-    assert provider._embedding_kwargs() == {}
+    assert provider._embedding_kwargs() == {"encoding_format": "float"}
+
+
+def test_openai_embedding_encoding_format_can_be_base64():
+    provider = OpenAIEmbeddingProvider.__new__(OpenAIEmbeddingProvider)
+    provider.provider_config = {"embedding_encoding_format": "base64"}
+
+    assert provider._embedding_kwargs() == {"encoding_format": "base64"}
+
+
+def test_openai_embedding_encoding_format_invalid_value_falls_back_to_float():
+    provider = OpenAIEmbeddingProvider.__new__(OpenAIEmbeddingProvider)
+    provider.provider_config = {"embedding_encoding_format": "unsupported"}
+
+    assert provider._embedding_kwargs() == {"encoding_format": "float"}
+
+
+def test_openai_embedding_decodes_base64_response():
+    encoded_embedding = base64.b64encode(array("f", [0.5, -1.25]).tobytes()).decode()
+
+    assert OpenAIEmbeddingProvider._embedding_values(encoded_embedding) == [0.5, -1.25]
