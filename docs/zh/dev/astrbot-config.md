@@ -358,7 +358,7 @@ Firecrawl 搜索引擎的 API Key 列表。使用 `firecrawl` 作为网页搜索
 
 #### `provider_settings.show_tool_use_status`
 
-是否显示工具使用状态。默认为 `false`。启用后，模型在使用工具时会显示工具的名称和输入参数。
+是否显示工具使用状态。默认为 `false`。启用后，模型在使用工具时会显示工具的名称和输入参数。无论此项是否启用，流式回复都会在工具调用前结束当前消息，并在后续 LLM 回复到来时创建新消息。
 
 #### `provider_settings.streaming_segmented`
 

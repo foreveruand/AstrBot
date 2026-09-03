@@ -710,9 +710,7 @@ async def test_execute_handoff_uses_session_provider_settings_and_runner_fallbac
                     },
                     "agent_runner": {
                         "config": {
-                            "model": {
-                                "fallback_provider_ids": ["runtime-fallback"]
-                            },
+                            "model": {"fallback_provider_ids": ["runtime-fallback"]},
                             "misc": {"max_steps": 7},
                         }
                     },

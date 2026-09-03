@@ -445,15 +445,11 @@ class CronJobManager:
         provider_settings = cfg.get("provider_settings", {}) or {}
         agent_runner_config = cfg.get("agent_runner", {}).get("config", {})
         model_config = agent_runner_config.get("model", {})
-        tool_call_timeout = (
-            agent_runner_config
-            .get("misc", {})
-            .get("tool_call_timeout", 120)
+        tool_call_timeout = agent_runner_config.get("misc", {}).get(
+            "tool_call_timeout", 120
         )
         agent_max_step = coerce_int_config(
-            agent_runner_config
-            .get("misc", {})
-            .get("max_steps", 30),
+            agent_runner_config.get("misc", {}).get("max_steps", 30),
             default=30,
             min_value=1,
             field_name="agent_runner.config.misc.max_steps",

@@ -410,11 +410,7 @@ class FunctionToolExecutor(BaseFunctionToolExecutor[AstrAgentContext]):
         agent_runner_config = config.get("agent_runner", {}).get("config", {})
         model_config = agent_runner_config.get("model", {})
         prov_settings: dict = config.get("provider_settings", {})
-        agent_max_step = int(
-            agent_runner_config
-            .get("misc", {})
-            .get("max_steps", 30)
-        )
+        agent_max_step = int(agent_runner_config.get("misc", {}).get("max_steps", 30))
         run_extra = getattr(run_context.context, "extra", None)
         run_provider_settings = (
             run_extra.get("provider_settings") if isinstance(run_extra, dict) else None
@@ -624,9 +620,7 @@ class FunctionToolExecutor(BaseFunctionToolExecutor[AstrAgentContext]):
         agent_runner_config = cfg.get("agent_runner", {}).get("config", {})
         model_config = agent_runner_config.get("model", {})
         agent_max_step = coerce_int_config(
-            agent_runner_config
-            .get("misc", {})
-            .get("max_steps", 30),
+            agent_runner_config.get("misc", {}).get("max_steps", 30),
             default=30,
             min_value=1,
             field_name="agent_runner.config.misc.max_steps",

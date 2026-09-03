@@ -780,6 +780,55 @@ async def test_telegram_final_segment_splits_long_plaintext_when_markdown_fails(
 
 
 @pytest.mark.asyncio
+async def test_telegram_streaming_edit_starts_new_message_after_break():
+    TelegramPlatformEvent = _load_telegram_platform_event()
+    client = MagicMock()
+    client.send_chat_action = AsyncMock()
+    client.send_message = AsyncMock(
+        side_effect=[
+            SimpleNamespace(message_id=101),
+            SimpleNamespace(message_id=102),
+        ],
+    )
+    client.edit_message_text = AsyncMock()
+    event = TelegramPlatformEvent("msg", MagicMock(), MagicMock(), "session", client)
+
+    async def stream():
+        yield MessageChain().message("Before tool.")
+        yield MessageChain(type="break")
+        yield MessageChain().message("After tool.")
+
+    await event._send_streaming_edit("123456", None, {"chat_id": "123456"}, stream())
+
+    assert [call.kwargs["text"] for call in client.send_message.await_args_list] == [
+        "Before tool.",
+        "After tool.",
+    ]
+    assert client.edit_message_text.await_args.kwargs["message_id"] == 101
+
+
+@pytest.mark.asyncio
+async def test_telegram_streaming_draft_starts_new_segment_after_break():
+    TelegramPlatformEvent = _load_telegram_platform_event()
+    client = MagicMock()
+    client.send_message_draft = AsyncMock()
+    client.send_message = AsyncMock()
+    event = TelegramPlatformEvent("msg", MagicMock(), MagicMock(), "session", client)
+
+    async def stream():
+        yield MessageChain().message("Before tool.")
+        yield MessageChain(type="break")
+        yield MessageChain().message("After tool.")
+
+    await event._send_streaming_draft("123456", None, {"chat_id": "123456"}, stream())
+
+    assert [call.kwargs["text"] for call in client.send_message.await_args_list] == [
+        "Before tool.",
+        "After tool.",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_telegram_send_with_client_batches_images_into_media_groups():
     TelegramPlatformEvent = _load_telegram_platform_event()
     client = MagicMock()

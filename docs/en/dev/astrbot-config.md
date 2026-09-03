@@ -358,7 +358,7 @@ Whether to enable streaming responses. Default is `false`. When enabled, the mod
 
 #### `provider_settings.show_tool_use_status`
 
-Whether to show tool usage status. Default is `false`. When enabled, the model displays the tool name and input parameters when using a tool.
+Whether to show tool usage status. Default is `false`. When enabled, the model displays the tool name and input parameters when using a tool. Regardless of this setting, streaming replies end the current message before a tool call and start a new message when subsequent LLM output arrives.
 
 #### `provider_settings.streaming_segmented`
 

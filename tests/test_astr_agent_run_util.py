@@ -1,15 +1,21 @@
 import asyncio
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 from astrbot.core.agent.response import AgentResponse
 from astrbot.core.astr_agent_run_util import _simulated_stream_tts, run_agent
+from astrbot.core.message.components import Json
 from astrbot.core.message.message_event_result import MessageChain
 
 
 class _FakeEvent:
     """Minimal event surface used by the agent stream bridge."""
+
+    def __init__(self) -> None:
+        self.trace = SimpleNamespace(record=lambda *args, **kwargs: None)
+        self.send = AsyncMock()
 
     def is_stopped(self) -> bool:
         return False
@@ -52,6 +58,40 @@ class _MalformedStreamingErrorRunner(_StreamingErrorRunner):
         yield AgentResponse(type="err", data={})
 
 
+class _ToolCallStreamingRunner:
+    """Agent runner that emits LLM text before and after a tool call."""
+
+    streaming = True
+    req = None
+
+    def __init__(self) -> None:
+        self.finished = False
+        self.event = _FakeEvent()
+        self.run_context = SimpleNamespace(context=SimpleNamespace(event=self.event))
+
+    async def step(self):
+        yield AgentResponse(
+            type="streaming_delta",
+            data={"chain": MessageChain().message("Before tool.")},
+        )
+        yield AgentResponse(
+            type="tool_call",
+            data={
+                "chain": MessageChain(
+                    chain=[Json(data={"id": "call-1", "name": "search"})],
+                ),
+            },
+        )
+        yield AgentResponse(
+            type="streaming_delta",
+            data={"chain": MessageChain().message("After tool.")},
+        )
+        self.finished = True
+
+    def done(self) -> bool:
+        return self.finished
+
+
 @pytest.mark.asyncio
 async def test_run_agent_forwards_streaming_provider_error():
     error_text = (
@@ -73,6 +113,21 @@ async def test_run_agent_replaces_malformed_streaming_provider_error():
 
     assert len(chains) == 1
     assert chains[0].get_plain_text() == "Error occurred during AI execution."
+
+
+@pytest.mark.asyncio
+async def test_run_agent_breaks_stream_at_tool_call_when_tool_status_is_hidden():
+    runner = _ToolCallStreamingRunner()
+
+    chains = [chain async for chain in run_agent(runner, show_tool_use=False)]
+
+    assert [chain.type for chain in chains] == [None, "break", None]
+    assert [chain.get_plain_text() for chain in chains] == [
+        "Before tool.",
+        "",
+        "After tool.",
+    ]
+    runner.event.send.assert_not_awaited()
 
 
 @pytest.mark.asyncio
