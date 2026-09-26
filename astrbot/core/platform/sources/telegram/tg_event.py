@@ -1095,19 +1095,37 @@ class TelegramPlatformEvent(AstrMessageEvent):
             nonlocal delta
             delta += t
 
+        async def _finalize_current() -> None:
+            """将 delta 定稿到当前消息（MarkdownV2，失败回退纯文本）。"""
+            nonlocal current_content
+            try:
+                markdown_text = telegramify_markdown.markdownify(delta)
+                await self.client.edit_message_text(
+                    text=markdown_text,
+                    chat_id=payload["chat_id"],
+                    message_id=message_id,
+                    parse_mode="MarkdownV2",
+                )
+                current_content = delta
+                return
+            except Exception as e:
+                logger.warning(f"Markdown转换失败，使用普通文本: {e!s}")
+            await self.client.edit_message_text(
+                text=delta,
+                chat_id=payload["chat_id"],
+                message_id=message_id,
+            )
+            current_content = delta
+
         async for chain in generator:
             if not isinstance(chain, MessageChain):
                 continue
 
             if chain.type == "break":
-                # 分割符
-                if message_id:
+                # 分割符：定稿当前消息，后续内容在新消息中继续
+                if message_id and delta:
                     try:
-                        await self.client.edit_message_text(
-                            text=delta,
-                            chat_id=payload["chat_id"],
-                            message_id=message_id,
-                        )
+                        await _finalize_current()
                     except Exception as e:
                         logger.warning(f"编辑消息失败(streaming-break): {e!s}")
                 message_id = None
@@ -1154,24 +1172,8 @@ class TelegramPlatformEvent(AstrMessageEvent):
                     logger.warning(f"发送消息失败(streaming): {e!s}")
 
         try:
-            if delta and current_content != delta:
-                try:
-                    markdown_text = telegramify_markdown.markdownify(
-                        delta,
-                    )
-                    await self.client.edit_message_text(
-                        text=markdown_text,
-                        chat_id=payload["chat_id"],
-                        message_id=message_id,
-                        parse_mode="MarkdownV2",
-                    )
-                except Exception as e:
-                    logger.warning(f"Markdown转换失败，使用普通文本: {e!s}")
-                    await self.client.edit_message_text(
-                        text=delta,
-                        chat_id=payload["chat_id"],
-                        message_id=message_id,
-                    )
+            if delta and message_id and current_content != delta:
+                await _finalize_current()
         except Exception as e:
             logger.warning(f"编辑消息失败(streaming): {e!s}")
 

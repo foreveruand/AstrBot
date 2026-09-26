@@ -11,6 +11,8 @@ from astrbot.core.message.message_event_result import MessageChain
 class _FakeEvent:
     """Minimal event surface used by the agent stream bridge."""
 
+    trace = SimpleNamespace(record=lambda *args, **kwargs: None)
+
     def is_stopped(self) -> bool:
         return False
 
@@ -52,6 +54,14 @@ class _MalformedStreamingErrorRunner(_StreamingErrorRunner):
         yield AgentResponse(type="err", data={})
 
 
+class _ToolCallRunner(_StreamingErrorRunner):
+    """Streaming agent runner that emits a tool call and then finishes."""
+
+    async def step(self):
+        self.finished = True
+        yield AgentResponse(type="tool_call", data={"chain": MessageChain()})
+
+
 @pytest.mark.asyncio
 async def test_run_agent_forwards_streaming_provider_error():
     error_text = (
@@ -73,6 +83,15 @@ async def test_run_agent_replaces_malformed_streaming_provider_error():
 
     assert len(chains) == 1
     assert chains[0].get_plain_text() == "Error occurred during AI execution."
+
+
+@pytest.mark.asyncio
+async def test_run_agent_breaks_stream_on_tool_call_without_tool_use_status():
+    runner = _ToolCallRunner("unused")
+
+    chains = [chain async for chain in run_agent(runner, show_tool_use=False)]
+
+    assert [chain.type for chain in chains] == ["break"]
 
 
 @pytest.mark.asyncio

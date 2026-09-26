@@ -780,6 +780,33 @@ async def test_telegram_final_segment_splits_long_plaintext_when_markdown_fails(
 
 
 @pytest.mark.asyncio
+async def test_telegram_streaming_edit_sends_each_break_segment_as_new_message():
+    TelegramPlatformEvent = _load_telegram_platform_event()
+    client = MagicMock()
+    client.send_chat_action = AsyncMock()
+    client.send_message = AsyncMock(
+        side_effect=[
+            SimpleNamespace(message_id=1),
+            SimpleNamespace(message_id=2),
+        ],
+    )
+    client.edit_message_text = AsyncMock()
+    event = TelegramPlatformEvent("msg", MagicMock(), MagicMock(), "session", client)
+
+    async def generator():
+        yield MessageChain().message("first")
+        yield MessageChain(chain=[], type="break")
+        yield MessageChain().message("second")
+
+    await event._send_streaming_edit("123456", None, {"chat_id": "123456"}, generator())
+
+    assert client.send_message.await_count == 2
+    sent_texts = [call.kwargs["text"] for call in client.send_message.await_args_list]
+    assert sent_texts[0].startswith("first")
+    assert sent_texts[1].startswith("second")
+
+
+@pytest.mark.asyncio
 async def test_telegram_send_with_client_batches_images_into_media_groups():
     TelegramPlatformEvent = _load_telegram_platform_event()
     client = MagicMock()
